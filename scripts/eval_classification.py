@@ -142,8 +142,12 @@ def build_hf_pipeline(
     )
     return pipe
 
-def evaluate_with_pipeline(pipe, val_loader: DataLoader, num_classes: int) -> None:
-    """Evaluate model wrapped in HF pipeline on a classification dataset."""
+def evaluate_with_pipeline(pipe, val_loader: DataLoader, num_classes: int) -> Tuple[float, float, int]:
+    """Evaluate model wrapped in HF pipeline on a classification dataset.
+    
+    Returns:
+        Tuple of (top1_accuracy, top5_accuracy, n_samples)
+    """
     from PIL import Image
     import torchvision.transforms as T
     
@@ -378,12 +382,11 @@ def evaluate_with_pipeline(pipe, val_loader: DataLoader, num_classes: int) -> No
             n_samples += batch_size
             
             i += 1
-            if i >= 100:
-                break
 
     top1_avg = top1_sum / n_samples
     top5_avg = top5_sum / n_samples
     print(f"Eval: Top-1 = {top1_avg:.2f}%, Top-5 = {top5_avg:.2f}% (N={n_samples})")
+    return top1_avg, top5_avg, n_samples
 
 
 def get_standard_imagenet_synsets():

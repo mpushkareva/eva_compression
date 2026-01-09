@@ -12,12 +12,18 @@ This script:
 
 import argparse
 import json
-import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 import traceback
+
+# Import evaluation functions from eval_classification
+from eval_classification import (
+    build_hf_pipeline,
+    build_val_loader,
+    evaluate_with_pipeline,
+)
 
 
 def find_quantized_models(work_dir: Path) -> List[Tuple[str, Path]]:
@@ -63,123 +69,33 @@ def evaluate_model(
     work_dir: Path
 ) -> Dict:
     """
-    Evaluate a single model using eval_classification.py.
+    Evaluate a single model using the same evaluation logic as eval_classification.py.
     
     Returns:
         Dictionary with evaluation results
     """
-    # Get the script directory (where eval_classification.py is located)
-    script_dir = Path(__file__).parent
-    cmd = [
-        sys.executable,
-        str(script_dir / "eval_classification.py"),
-        "--model", model_path,
-        "--val-dir", args.val_dir,
-        "--batch-size", str(args.batch_size),
-        "--num-workers", str(args.num_workers),
-        "--device", args.device,
-        "--img-size", str(args.img_size),
-        "--eval-resize", str(args.eval_resize),
-        "--dataset", args.dataset,
-    ]
-    
-    if args.train_dir:
-        cmd.extend(["--train-dir", args.train_dir])
-    
-    if args.token:
-        cmd.extend(["--token", args.token])
-    
-    if args.use_imagenet_labels:
-        cmd.append("--use-imagenet-labels")
-    
-    if quantized_model_path:
-        cmd.extend(["--quantized-model", str(quantized_model_path)])
-    
     print(f"\n{'='*80}")
     print(f"Evaluating model: {model_path}")
     if quantized_model_path:
         print(f"  Quantized model: {quantized_model_path}")
-    print(f"Command: {' '.join(cmd)}")
     print(f"{'='*80}\n")
     
-    # Run evaluation and capture output
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False  # Don't raise on non-zero exit
+        # Build validation dataloader (same as eval_classification.py)
+        # For pipeline evaluation, skip normalization (pipeline handles it)
+        val_loader, num_classes = build_val_loader(args, normalize=False)
+        
+        # Build HF pipeline (same as eval_classification.py)
+        pipe = build_hf_pipeline(
+            model_path,
+            device=args.device,
+            num_labels=num_classes,
+            token=args.token,
+            quantized_model_path=quantized_model_path
         )
         
-        # Parse output to extract Top-1 and Top-5 accuracy
-        top1 = None
-        top5 = None
-        n_samples = None
-        
-        # Look for the final evaluation line: "Eval: Top-1 = X.XX%, Top-5 = Y.YY% (N=ZZZ)"
-        for line in result.stdout.split('\n'):
-            if 'Eval: Top-1' in line:
-                # Parse: "Eval: Top-1 = 85.23%, Top-5 = 95.67% (N=50000)"
-                try:
-                    parts = line.split('Eval:')[1].strip()
-                    top1_part = [p for p in parts.split(',') if 'Top-1' in p][0]
-                    top5_part = [p for p in parts.split(',') if 'Top-5' in p][0]
-                    n_part = [p for p in parts.split('(') if 'N=' in p][0]
-                    
-                    top1 = float(top1_part.split('=')[1].strip().replace('%', ''))
-                    top5 = float(top5_part.split('=')[1].strip().replace('%', ''))
-                    n_samples = int(n_part.split('=')[1].strip().replace(')', ''))
-                except (ValueError, IndexError) as e:
-                    print(f"Warning: Could not parse evaluation line: {line}")
-                    print(f"Error: {e}")
-        
-        # If parsing failed, try to extract from stderr or look for other patterns
-        if top1 is None:
-            # Try stderr
-            for line in result.stderr.split('\n'):
-                if 'Eval: Top-1' in line:
-                    try:
-                        parts = line.split('Eval:')[1].strip()
-                        top1_part = [p for p in parts.split(',') if 'Top-1' in p][0]
-                        top5_part = [p for p in parts.split(',') if 'Top-5' in p][0]
-                        n_part = [p for p in parts.split('(') if 'N=' in p][0]
-                        
-                        top1 = float(top1_part.split('=')[1].strip().replace('%', ''))
-                        top5 = float(top5_part.split('=')[1].strip().replace('%', ''))
-                        n_samples = int(n_part.split('=')[1].strip().replace(')', ''))
-                    except (ValueError, IndexError):
-                        pass
-        
-        # Check if evaluation was successful
-        if result.returncode != 0:
-            error_msg = result.stderr if result.stderr else "Unknown error"
-            print(f"ERROR: Evaluation failed with return code {result.returncode}")
-            print(f"Error output: {error_msg[:500]}")
-            return {
-                "model": model_path,
-                "quantized_model": quantized_model_path,
-                "status": "error",
-                "error": error_msg[:1000],  # Truncate long errors
-                "return_code": result.returncode,
-                "top1": None,
-                "top5": None,
-                "n_samples": None,
-                "timestamp": datetime.now().isoformat()
-            }
-        
-        if top1 is None or top5 is None:
-            return {
-                "model": model_path,
-                "quantized_model": quantized_model_path,
-                "status": "error",
-                "error": "Could not parse evaluation results from output",
-                "stdout": result.stdout[-1000:],  # Last 1000 chars
-                "stderr": result.stderr[-1000:] if result.stderr else None,
-                "top1": None,
-                "top5": None,
-                "n_samples": None,
-                "timestamp": datetime.now().isoformat()
-            }
+        # Evaluate using pipeline (same as eval_classification.py)
+        top1, top5, n_samples = evaluate_with_pipeline(pipe, val_loader, num_classes=num_classes)
         
         return {
             "model": model_path,
