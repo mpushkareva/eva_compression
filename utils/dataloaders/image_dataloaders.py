@@ -87,12 +87,14 @@ class CIFAR10WithImageNetLabels(Dataset):
         self.cifar_dataset = cifar_dataset
         self.label_mapping = label_mapping
         # Create mapping from CIFAR-10 class index to ImageNet class index
-        self.cifar_idx_to_imagenet_idx = {}
-        for cifar_idx, class_name in enumerate(cifar_dataset.classes):
-            if class_name in label_mapping:
-                self.cifar_idx_to_imagenet_idx[cifar_idx] = label_mapping[class_name]
-            else:
-                raise ValueError(f"CIFAR-10 class '{class_name}' not found in label_mapping")
+        self.cifar_idx_to_imagenet_idx = {
+            cifar_idx: label_mapping[class_name]
+            for cifar_idx, class_name in enumerate(cifar_dataset.classes)
+            if class_name in label_mapping
+        }
+        if len(self.cifar_idx_to_imagenet_idx) != len(cifar_dataset.classes):
+            missing = set(cifar_dataset.classes) - set(label_mapping.keys())
+            raise ValueError(f"CIFAR-10 classes not found in label_mapping: {missing}")
     
     def __len__(self):
         return len(self.cifar_dataset)
@@ -147,13 +149,11 @@ def get_cifar_dataloaders(
     train_ds_base = DatasetClass(root=root, train=True, transform=train_transform, download=True)
     val_ds_base = DatasetClass(root=root, train=False, transform=val_transform, download=True)
     
-    # Wrap with ImageNet label mapping if requested
     if use_imagenet_labels:
         train_ds = CIFAR10WithImageNetLabels(train_ds_base, CIFAR10_TO_IMAGENET_MAPPING)
         val_ds = CIFAR10WithImageNetLabels(val_ds_base, CIFAR10_TO_IMAGENET_MAPPING)
     else:
-        train_ds = train_ds_base
-        val_ds = val_ds_base
+        train_ds, val_ds = train_ds_base, val_ds_base
 
     train_loader = DataLoader(
         train_ds,
@@ -203,34 +203,24 @@ def get_imagenet_dataloaders(
     Returns:
         Tuple of (train_loader, val_loader). train_loader is None if train_dir is None.
     """
-    # Infer root directory from val_dir (assuming structure: root/val/)
-    # If val_dir ends with 'val', use its parent; otherwise use val_dir itself as root
+    # Infer root directory from val_dir
     val_dir_normalized = val_dir.rstrip('/')
-    if os.path.basename(val_dir_normalized) == 'val':
-        root = os.path.dirname(val_dir_normalized)
-    else:
-        # If val_dir doesn't end with 'val', assume it's the root directory
-        root = val_dir_normalized
+    root = os.path.dirname(val_dir_normalized) if os.path.basename(val_dir_normalized) == 'val' else val_dir_normalized
     
-    # Handle devkit location: torchvision.datasets.ImageNet expects devkit at root/ILSVRC2012_devkit_t12/
-    # But it might be at root/devkit/ILSVRC2012_devkit_t12/
+    # Handle devkit location symlink if needed
     devkit_expected = os.path.join(root, 'ILSVRC2012_devkit_t12')
     devkit_alternative = os.path.join(root, 'devkit', 'ILSVRC2012_devkit_t12')
     
-    # Create symlink if devkit is in alternative location and expected location doesn't exist
     if not os.path.exists(devkit_expected) and os.path.exists(devkit_alternative):
         try:
-            # Use relative path for symlink to make it more portable
             rel_path = os.path.relpath(devkit_alternative, root)
             os.symlink(rel_path, devkit_expected)
         except (OSError, FileExistsError):
-            # Symlink might already exist or we don't have permission, try to continue
-            # If it's a broken symlink, try to remove and recreate
+            # Try to fix broken symlink
             if os.path.islink(devkit_expected) and not os.path.exists(devkit_expected):
                 try:
                     os.unlink(devkit_expected)
-                    rel_path = os.path.relpath(devkit_alternative, root)
-                    os.symlink(rel_path, devkit_expected)
+                    os.symlink(os.path.relpath(devkit_alternative, root), devkit_expected)
                 except OSError:
                     pass
     
