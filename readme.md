@@ -153,10 +153,10 @@ python scripts/eval_classification.py \
 **Evaluate quantized model:**
 ```bash
 python scripts/eval_classification.py \
-  --model timm/eva02_base_patch14_224.mim_in22k \
+  --model timm/eva02_small_patch14_336.mim_in22k_ft_in1k \
   --val-dir ./data/imagenet/val \
   --dataset imagenet \
-  --quantized-model checkpoints/quantized_eva.wrapper.pth \
+  --quantized-model checkpoints/quantized_model.pth \
   --device cuda
 ```
 
@@ -168,7 +168,7 @@ python scripts/eval_classification.py \
   --model timm/eva02_small_patch14_336.mim_in22k_ft_in1k \
   --val-dir ./data/cifar-10-batches-py \
   --dataset cifar10 \
-  --device cpu
+  --device cuda
 ```
 
 #### Evaluate on CIFAR-10 with ImageNet labels (for ImageNet-trained models):
@@ -182,6 +182,8 @@ python scripts/eval_classification.py \
 ```
 
 When using `--use-imagenet-labels`, CIFAR-10 labels are mapped to corresponding ImageNet class indices. This allows you to use ImageNet-trained models directly on CIFAR-10 data without fine-tuning. The model will output predictions for all 1000 ImageNet classes, and accuracy is computed based on the mapped ImageNet class indices.
+
+# TODO: check class labels after changes
 
 **CIFAR-10 to ImageNet mapping:**
 - airplane → airliner (class 404)
@@ -201,7 +203,7 @@ Evaluate all quantized models in the checkpoints directory:
 
 ```bash
 python scripts/evaluate_all_models.py \
-  --base-model timm/eva02_base_patch14_224.mim_in22k \
+  --base-model timm/eva02_small_patch14_336.mim_in22k_ft_in1k \
   --val-dir ./data/imagenet/val \
   --dataset imagenet \
   --work-dir checkpoints \

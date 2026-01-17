@@ -43,29 +43,22 @@ def _get_hf_token(token: str = None) -> str:
         return None
 
 
-def _load_quantized_weights(model, quantized_path: Path, device: str):
-    """Load quantized weights into model."""
+def _load_quantized_model(quantized_path: Path, device: str):
+    """Load quantized model directly from file."""
     wrapper_path = quantized_path.with_suffix('.wrapper.pth')
     if wrapper_path.exists():
         print(f"Loading quantized wrapper model from: {wrapper_path}")
         state_dict = torch.load(wrapper_path, map_location=device)
-        model.load_state_dict(state_dict, strict=False)
         print("Quantized wrapper model loaded successfully!")
-        return True
+        return state_dict
     
     if not quantized_path.exists():
-        return False
+        raise FileNotFoundError(f"Quantized model file not found: {quantized_path}")
     
     print(f"Loading quantized model state dict from: {quantized_path}")
-    quantized_state_dict = torch.load(quantized_path, map_location=device)
-    
-    if hasattr(model, 'model'):
-        model.model.load_state_dict(quantized_state_dict, strict=False)
-        print("Quantized model weights loaded into wrapper!")
-    else:
-        model.load_state_dict(quantized_state_dict, strict=False)
-        print("Quantized model weights loaded!")
-    return True
+    state_dict = torch.load(quantized_path, map_location=device)
+    print("Quantized model state dict loaded!")
+    return state_dict
 
 
 def build_hf_pipeline(
@@ -81,11 +74,11 @@ def build_hf_pipeline(
     model_name_or_path:
         - 'timm/eva02_base_patch14_224.mim_in22k'  (EVA feature extractor -> you need head)
         - 'your-org/quantized-eva-checkpoint'
-        - local path to base model (for loading quantized weights)
+        - local path to base model (only used if quantized_model_path is not provided)
     
     quantized_model_path:
-        - Path to quantized model state dict (.pth file)
-        - If provided, will load the base model and then load quantized weights
+        - Path to quantized model state dict (.pth file) or wrapper (.wrapper.pth file)
+        - If provided, will load the quantized model directly without matching with base model
     """
     import os
     from pathlib import Path
@@ -94,33 +87,28 @@ def build_hf_pipeline(
     token = _get_hf_token(token)
     device_index = 0 if device == "cuda" and torch.cuda.is_available() else -1
 
-    image_processor = AutoImageProcessor.from_pretrained(model_name_or_path, token=token)
-    model = TimmWrapperForImageClassification.from_pretrained(
-        model_name_or_path,
-        num_labels=num_labels,
-        ignore_mismatched_sizes=True,
-        token=token,
-    )
-    
     if quantized_model_path:
+        # Load quantized model directly
         quantized_path = Path(quantized_model_path)
-        try:
-            _load_quantized_weights(model, quantized_path, device)
-        except Exception as e:
-            print(f"Warning: Could not load quantized model: {e}")
-            print("Continuing with non-quantized model...")
-            import traceback
-            traceback.print_exc()
-    
-    # Check if head is randomly initialized
-    if hasattr(model, 'classifier'):
-        head_params = list(model.classifier.parameters())
-        if head_params:
-            weight_norm = head_params[0].data.norm().item()
-            print(f"Classification head weight norm: {weight_norm:.6f}")
-            if weight_norm < 0.01:
-                print("WARNING: Classification head appears to be randomly initialized!")
-                print("The model may need fine-tuning or a checkpoint with a trained head.")
+        print(f"Loading quantized model directly from: {quantized_path}")
+        # quantized_state_dict = _load_quantized_model(quantized_path, device)
+        
+        image_processor = AutoImageProcessor.from_pretrained(model_name_or_path, token=token)
+        model = TimmWrapperForImageClassification.from_pretrained(
+            quantized_path,
+            num_labels=num_labels,
+            ignore_mismatched_sizes=True,
+            token=token,
+        )
+    else:
+        # Load base model normally
+        image_processor = AutoImageProcessor.from_pretrained(model_name_or_path, token=token)
+        model = TimmWrapperForImageClassification.from_pretrained(
+            model_name_or_path,
+            num_labels=num_labels,
+            ignore_mismatched_sizes=True,
+            token=token,
+        )
 
     pipe = pipeline(
         task="image-classification",
@@ -223,7 +211,6 @@ def evaluate_with_pipeline(pipe, val_loader: DataLoader, num_classes: int) -> Tu
             
             pixel_values_batch = torch.cat(processed_images, dim=0).to(device)
             
-            # Get logits from model
             outputs = model(pixel_values_batch)
             logits_batch = outputs.logits.cpu() if hasattr(outputs, 'logits') else outputs.cpu()
             

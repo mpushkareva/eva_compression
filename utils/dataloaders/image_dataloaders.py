@@ -207,23 +207,6 @@ def get_imagenet_dataloaders(
     val_dir_normalized = val_dir.rstrip('/')
     root = os.path.dirname(val_dir_normalized) if os.path.basename(val_dir_normalized) == 'val' else val_dir_normalized
     
-    # Handle devkit location symlink if needed
-    devkit_expected = os.path.join(root, 'ILSVRC2012_devkit_t12')
-    devkit_alternative = os.path.join(root, 'devkit', 'ILSVRC2012_devkit_t12')
-    
-    if not os.path.exists(devkit_expected) and os.path.exists(devkit_alternative):
-        try:
-            rel_path = os.path.relpath(devkit_alternative, root)
-            os.symlink(rel_path, devkit_expected)
-        except (OSError, FileExistsError):
-            # Try to fix broken symlink
-            if os.path.islink(devkit_expected) and not os.path.exists(devkit_expected):
-                try:
-                    os.unlink(devkit_expected)
-                    os.symlink(os.path.relpath(devkit_alternative, root), devkit_expected)
-                except OSError:
-                    pass
-    
     val_transform = get_image_val_transform(img_size=img_size, eval_resize=eval_resize, normalize=normalize)
     val_ds = datasets.ImageNet(root=root, split='val', transform=val_transform)
     

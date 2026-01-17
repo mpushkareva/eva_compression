@@ -4,7 +4,6 @@ Manual quantization script for EVA-transformer models.
 
 This script manually quantizes EVA-transformer models by converting weights
 to int8 format and saving float scales for each weight tensor.
-Analogous to quantize_eva.py but with manual quantization implementation.
 """
 
 import argparse
@@ -17,30 +16,27 @@ from transformers import AutoImageProcessor, TimmWrapperForImageClassification
 
 
 class LayerTypeIdentifier:
-    """Identifies different layer types in EVA-transformer models."""
-    
-    # Common layer type patterns in transformer models
     ATTENTION_PATTERNS = [
-        'attn', 'attention', 'self_attn', 'self_attention',
-        'qkv', 'q_proj', 'k_proj', 'v_proj', 'out_proj'
+        'attn', 
     ]
     
     MLP_PATTERNS = [
-        'mlp', 'feed_forward', 'ffn', 'fc1', 'fc2',
-        'gate_proj', 'up_proj', 'down_proj'
+        'mlp',
     ]
     
     EMBEDDING_PATTERNS = [
-        'embed', 'patch_embed', 'pos_embed', 'cls_token'
+        'patch_embed',
+        'rope'
     ]
     
     NORM_PATTERNS = [
-        'norm', 'ln', 'layer_norm', 'group_norm'
+        'norm1', 'norm2', 
     ]
     
     HEAD_PATTERTERNS = [
-        'head', 'classifier', 'fc', 'proj'
+        'head'
     ]
+    
     
     @classmethod
     def identify_layer_type(cls, module_name: str, module: nn.Module) -> str:
@@ -82,23 +78,12 @@ class LayerTypeIdentifier:
 
 
 class ManualQuantizer:
-    """Manually quantizes model weights to int8 format with float scales."""
-    
     def __init__(
         self,
         quantize_config: Dict[str, bool],
         dtype: str = 'qint8',
         per_channel: bool = False,
     ):
-        """
-        Initialize the manual quantizer.
-        
-        Args:
-            quantize_config: Dictionary mapping layer types to boolean flags
-                (e.g., {'attention': True, 'mlp': True, 'embedding': False})
-            dtype: Quantization dtype ('qint8' for signed, 'quint8' for unsigned)
-            per_channel: Whether to use per-channel quantization
-        """
         self.quantize_config = quantize_config
         self.dtype = dtype
         self.per_channel = per_channel
@@ -106,7 +91,6 @@ class ManualQuantizer:
         self.is_signed = (dtype == 'qint8')
         
     def should_quantize(self, module_name: str, module: nn.Module) -> bool:
-        """Check if a module should be quantized based on its type."""
         layer_type = self.layer_identifier.identify_layer_type(module_name, module)
         return self.quantize_config.get(layer_type, False)
     
@@ -115,38 +99,18 @@ class ManualQuantizer:
         weight: torch.Tensor,
         per_channel: Optional[bool] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Manually quantize a weight tensor to int8.
-        
-        Args:
-            weight: Float weight tensor to quantize
-            per_channel: Whether to use per-channel quantization (overrides self.per_channel)
-        
-        Returns:
-            Tuple of (quantized_int8_tensor, scale_tensor)
-            - quantized_int8_tensor: int8 quantized weights
-            - scale_tensor: float scale(s) for dequantization
-        """
         if per_channel is None:
             per_channel = self.per_channel
         
         if per_channel and weight.dim() > 1:
-            # Per-channel quantization: compute scale for each output channel
-            # For 2D tensors (Linear): scale per output channel (first dimension)
-            # For 4D tensors (Conv2d): scale per output channel (first dimension)
             if weight.dim() == 2:
-                # Linear layer: [out_features, in_features]
-                # Compute scale per output channel
                 abs_max = torch.abs(weight).max(dim=1, keepdim=True)[0]
             elif weight.dim() == 4:
-                # Conv2d layer: [out_channels, in_channels, kernel_h, kernel_w]
-                # Compute scale per output channel
                 abs_max = torch.abs(weight).view(weight.size(0), -1).max(dim=1, keepdim=True)[0]
             else:
-                # Fallback to per-tensor
                 abs_max = torch.abs(weight).max()
                 scale = abs_max / (127.0 if self.is_signed else 255.0)
-                scale = scale.clamp(min=1e-8)  # Avoid division by zero
+                scale = scale.clamp(min=1e-8)
                 
                 quantized = weight / scale
                 quantized = quantized.round().clamp(
@@ -156,11 +120,9 @@ class ManualQuantizer:
                 
                 return quantized, scale
             
-            # Per-channel scale
             scale = abs_max / (127.0 if self.is_signed else 255.0)
-            scale = scale.clamp(min=1e-8)  # Avoid division by zero
+            scale = scale.clamp(min=1e-8)
             
-            # Quantize per channel
             if weight.dim() == 2:
                 quantized = weight / scale
             elif weight.dim() == 4:
@@ -174,10 +136,9 @@ class ManualQuantizer:
             
             return quantized, scale.squeeze()
         else:
-            # Per-tensor quantization
             abs_max = torch.abs(weight).max()
             scale = abs_max / (127.0 if self.is_signed else 255.0)
-            scale = scale.clamp(min=1e-8)  # Avoid division by zero
+            scale = scale.clamp(min=1e-8)
             
             quantized = weight / scale
             quantized = quantized.round().clamp(
@@ -191,17 +152,7 @@ class ManualQuantizer:
         self,
         model: nn.Module
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        """
-        Manually quantize model weights.
         
-        Args:
-            model: Model to quantize
-        
-        Returns:
-            Tuple of (quantized_weights_dict, scales_dict)
-            - quantized_weights_dict: Dictionary mapping parameter names to int8 tensors
-            - scales_dict: Dictionary mapping parameter names to float scale tensors
-        """
         quantized_weights = {}
         scales = {}
         
@@ -209,7 +160,6 @@ class ManualQuantizer:
             if not self.should_quantize(name, module):
                 continue
             
-            # Quantize Linear layer weights
             if isinstance(module, nn.Linear) and hasattr(module, 'weight') and module.weight is not None:
                 weight = module.weight.data
                 quantized_weight, scale = self.quantize_tensor(weight)
@@ -217,7 +167,6 @@ class ManualQuantizer:
                 scales[name + '.weight'] = scale
                 print(f"Quantized {name}.weight: shape={weight.shape}, scale_shape={scale.shape if isinstance(scale, torch.Tensor) else 'scalar'}")
             
-            # Quantize Conv2d layer weights
             if isinstance(module, nn.Conv2d) and hasattr(module, 'weight') and module.weight is not None:
                 weight = module.weight.data
                 quantized_weight, scale = self.quantize_tensor(weight)
@@ -225,7 +174,6 @@ class ManualQuantizer:
                 scales[name + '.weight'] = scale
                 print(f"Quantized {name}.weight: shape={weight.shape}, scale_shape={scale.shape if isinstance(scale, torch.Tensor) else 'scalar'}")
             
-            # Quantize Embedding layer weights
             if isinstance(module, nn.Embedding) and hasattr(module, 'weight') and module.weight is not None:
                 weight = module.weight.data
                 quantized_weight, scale = self.quantize_tensor(weight)
@@ -242,18 +190,6 @@ def load_eva_model(
     token: Optional[str] = None,
     return_wrapper: bool = False
 ) -> nn.Module:
-    """Load EVA transformer model using the same method as eval_classification.py.
-    
-    Args:
-        model_name_or_path: HuggingFace model ID or local path
-        num_labels: Number of classification labels
-        token: HuggingFace token (optional)
-        return_wrapper: If True, return the TimmWrapperForImageClassification wrapper.
-                       If False, return the underlying timm model.
-    
-    Returns:
-        The model (wrapper or underlying timm model depending on return_wrapper)
-    """
     if token is None:
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
     if token is None:
@@ -263,7 +199,6 @@ def load_eva_model(
         except Exception:
             pass
     
-    # Load model exactly as in eval_classification.py
     model = TimmWrapperForImageClassification.from_pretrained(
         model_name_or_path,
         num_labels=num_labels,
@@ -274,15 +209,11 @@ def load_eva_model(
     if return_wrapper:
         return model
     
-    # Get the underlying timm model (same structure as used in eval_classification.py)
-    # TimmWrapperForImageClassification wraps the timm model
     if hasattr(model, 'model'):
-        # The underlying timm model is typically at model.model
         return model.model
     elif hasattr(model, 'timm_model'):
         return model.timm_model
     else:
-        # Fallback: return the wrapper itself
         print("Warning: Could not find underlying timm model, using wrapper directly")
         return model
 
@@ -355,30 +286,24 @@ def main():
     )
     # Set defaults for layer quantization (enabled by default for most layers)
     parser.set_defaults(
-        quantize_attention=True,
-        quantize_mlp=True,
-        quantize_embedding=True,
+        quantize_attention=False,
+        quantize_mlp=False,
+        quantize_embedding=False,
         quantize_norm=False,
-        quantize_head=True
+        quantize_head=False
     )
     
     parser.add_argument(
         "--quantize-attention",
         dest="quantize_attention",
         action="store_true",
-        help="Quantize attention layers (default: enabled)"
-    )
-    parser.add_argument(
-        "--no-quantize-attention",
-        dest="quantize_attention",
-        action="store_false",
-        help="Disable quantization of attention layers"
+        help="Quantize attention layers (default: disabled)"
     )
     parser.add_argument(
         "--quantize-mlp",
         dest="quantize_mlp",
         action="store_true",
-        help="Quantize MLP/feed-forward layers (default: enabled)"
+        help="Quantize MLP/feed-forward layers (default: disabled)"
     )
     parser.add_argument(
         "--no-quantize-mlp",
@@ -390,13 +315,7 @@ def main():
         "--quantize-embedding",
         dest="quantize_embedding",
         action="store_true",
-        help="Quantize embedding layers (default: enabled)"
-    )
-    parser.add_argument(
-        "--no-quantize-embedding",
-        dest="quantize_embedding",
-        action="store_false",
-        help="Disable quantization of embedding layers"
+        help="Quantize embedding layers (default: disabled)"
     )
     parser.add_argument(
         "--quantize-norm",
@@ -408,30 +327,12 @@ def main():
         "--quantize-head",
         dest="quantize_head",
         action="store_true",
-        help="Quantize classification head (default: enabled)"
-    )
-    parser.add_argument(
-        "--no-quantize-head",
-        dest="quantize_head",
-        action="store_false",
-        help="Disable quantization of classification head"
+        help="Quantize classification head (default: disabled)"
     )
     parser.add_argument(
         "--quantize-all",
         action="store_true",
-        help="Quantize all layer types (overrides individual flags)"
-    )
-    parser.add_argument(
-        "--no-quantize",
-        action="store_true",
-        help="Disable all quantization (useful for analysis only)"
-    )
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="qint8",
-        choices=["qint8", "quint8"],
-        help="Quantization dtype (qint8 for signed, quint8 for unsigned)"
+        help="Quantize all layer types (overrides individual flags, default: disabled)"
     )
     parser.add_argument(
         "--per-channel",
@@ -453,17 +354,7 @@ def main():
     args = parser.parse_args()
     
     # Build quantization config
-    if args.no_quantize:
-        # Disable all quantization
-        quantize_config = {
-            'attention': False,
-            'mlp': False,
-            'embedding': False,
-            'norm': False,
-            'head': False,
-            'other': False
-        }
-    elif args.quantize_all:
+    if args.quantize_all:
         # Quantize everything
         quantize_config = {
             'attention': True,
@@ -489,7 +380,6 @@ def main():
     model_wrapper = load_eva_model(args.model, args.num_labels, args.token, return_wrapper=True)
     model_wrapper.eval()
     
-    # Get the underlying timm model for quantization
     if hasattr(model_wrapper, 'model'):
         model = model_wrapper.model
     elif hasattr(model_wrapper, 'timm_model'):
