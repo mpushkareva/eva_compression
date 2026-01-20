@@ -8,6 +8,7 @@ Supports both weight and activation quantization.
 """
 
 import argparse
+from copy import deepcopy
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Type
@@ -30,6 +31,46 @@ from transformers import AutoImageProcessor, TimmWrapperForImageClassification
 
 GROUP_SIZE = 32
 
+#  EvaAttention
+#       blocks.0.attn.qkv: Linear
+#       blocks.0.attn.q_norm: Identity
+#       blocks.0.attn.k_norm: Identity
+#       blocks.0.attn.attn_drop: Dropout
+#       blocks.0.attn.norm: Identity
+#       blocks.0.attn.proj: Linear
+#       blocks.0.attn.proj_drop: Dropout
+
+class EvaAttentionQuantized(nn.Module):
+    def __init__(self, in_features: int):
+        super().__init__()
+        self.q_linear = nn.Linear(in_features=in_features, out_features=in_features)
+        self.k_linear = nn.Linear(in_features=in_features, out_features=in_features)
+        self.v_linear = nn.Linear(in_features=in_features, out_features=in_features)
+        self.q_norm = nn.Identity()
+        self.k_norm = nn.Identity()
+        self.attn_drop = nn.Dropout()
+        self.norm = nn.Identity()
+        self.proj = nn.Linear(in_features=in_features, out_features=in_features * 3)
+        self.proj_drop = nn.Dropout()
+
+    def _copy_weights(self, qkv_module: nn.Module):
+        self.q_linear.weight.data = qkv_module.q_linear.weight.data
+        self.q_linear.bias.data = qkv_module.q_linear.bias.data
+        self.k_linear.weight.data = qkv_module.k_linear.weight.data
+        self.k_linear.bias.data = qkv_module.k_linear.bias.data
+        self.v_linear.weight.data = qkv_module.v_linear.weight.data
+        self.v_linear.bias.data = qkv_module.v_linear.bias.data
+        self.proj.weight.data = qkv_module.proj.weight.data
+        self.proj.bias.data = qkv_module.proj.bias.data
+        self.proj_drop.bias.data = qkv_module.proj_drop.bias.data
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        q = self.q_norm(self.q_linear(x))
+        k = self.k_norm(self.k_linear(x))
+        v = self.v_norm(self.v_linear(x))
+        attn = self.attn_drop(q @ k.transpose(-2, -1))
+        attn = self.norm(attn)
+        return self.proj(attn)
 
 class SelectiveQuantizer:
     
@@ -44,13 +85,60 @@ class SelectiveQuantizer:
         self.dtype = dtype
         self.weight_bits = weight_bits
         self.activation_bits = activation_bits
+        
     
     def quantize_weights_only(self, model: nn.Module) -> nn.Module:
-        if self.weight_bits == 4:
-            quantize_(model, Int4WeightOnlyConfig(group_size=GROUP_SIZE))
-        else:
-            quantize_(model, Int8WeightOnlyConfig(group_size=GROUP_SIZE))
-        return model
+        
+        quantized_model = deepcopy(model)
+
+        
+        # Collect modules to quantize with their parent info
+        module_info = {}
+        for name, module in quantized_model.named_modules():
+            # Only quantize modules that have weights (Linear, Conv2d, etc.)
+            if hasattr(module, 'weight') and module.weight is not None:
+                # Skip if it's not a quantizable layer type
+                if not isinstance(module, (nn.Linear, nn.Conv2d, nn.Embedding)):
+                    continue
+                
+                # Split name to get parent and attribute name
+                name_parts = name.split('.')
+                parent_name = '.'.join(name_parts[:-1]) if len(name_parts) > 1 else ''
+                attr_name = name_parts[-1]
+                
+                module_info[name] = {
+                    'module': module,
+                    'parent_name': parent_name,
+                    'attr_name': attr_name
+                }
+        
+        # Quantize each module
+        for name, info in module_info.items():
+            # Navigate to parent module in quantized_model
+            if info['parent_name']:
+                parent = quantized_model
+                for part in info['parent_name'].split('.'):
+                    parent = getattr(parent, part)
+            else:
+                parent = quantized_model
+
+            group_size = info['module'].weight.size(1)
+            if info['attr_name'] == 'qkv':
+                module = EvaAttentionQuantized(in_features=group_size)
+                module._copy_weights(info['module'])
+                setattr(parent, info['attr_name'], module)
+                continue
+            
+            if self.weight_bits == 4:
+                quantize_(info['module'], Int4WeightOnlyConfig(group_size=group_size))
+            elif self.weight_bits == 8:
+                quantize_(info['module'], Int8WeightOnlyConfig(group_size=group_size))
+            else:
+                raise ValueError(f"Unsupported weight bit width: {self.weight_bits}")
+            
+            setattr(parent, info['attr_name'], info['module'])
+        
+        return quantized_model
     
     def quantize_dynamic(
         self,
@@ -117,7 +205,6 @@ def load_eva_model(
         ignore_mismatched_sizes=True,
         token=token,
     )
-    
     if return_wrapper:
         return model
     
@@ -143,106 +230,44 @@ def print_model_structure(model: nn.Module, max_depth: int = 3):
     print("...\n")
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        help="HuggingFace model ID or local path to EVA model"
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        required=True,
-        help="Output path to save quantized model"
-    )
-    parser.add_argument(
-        "--num-labels",
-        type=int,
-        default=1000,
-        help="Number of classification labels (default: 1000 for ImageNet)"
-    )
-    parser.add_argument(
-        "--mode",
-        type=str,
-        default="dynamic",
-        choices=["dynamic", "weights_only"],
-        help="Quantization mode: dynamic (quantizes weights+activations, requires calibration), "
-    )
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="qint8",
-        choices=["qint8", "quint8"],
-        help="Quantization dtype (qint8 for signed, quint8 for unsigned)"
-    )
-    parser.add_argument(
-        "--weight-bits",
-        type=int,
-        default=8,
-        choices=[4, 8]
-    )
-    parser.add_argument(
-        "--activation-bits",
-        type=int,
-        default=8,
-        choices=[4, 8]
-    )
-    parser.add_argument(
-        "--token",
-        type=str,
-        default=None,
-        help="HuggingFace token (optional)"
-    )
-    
-    args = parser.parse_args()
+def quantize_torch(
+    model_name_or_path: str,
+    num_labels: int = 1000,
+    mode: str = "dynamic",
+    dtype: str = "qint8",
+    weight_bits: int = 8,
+    activation_bits: int = 8,
+    verbose: bool = False,
+):
             
-    print(f"Loading model from: {args.model}")
-    model_wrapper = load_eva_model(args.model, args.num_labels, args.token, return_wrapper=True)
+    print(f"Loading, model from: {model_name_or_path}")
+    model_wrapper = load_eva_model(model_name_or_path, num_labels, return_wrapper=True)
     model_wrapper.eval()
+
     
-    # Get the underlying timm model for quantization
-    if hasattr(model_wrapper, 'model'):
-        model = model_wrapper.model
-    elif hasattr(model_wrapper, 'timm_model'):
-        model = model_wrapper.timm_model
-    else:
-        model = model_wrapper
+    model = model_wrapper.timm_model
     
     model.eval()
-    print(f"Model type: {type(model).__name__}")
-    print(f"Wrapper type: {type(model_wrapper).__name__}")
-    
-    print_model_structure(model)
+    if verbose:
+        print(f"Model type: {type(model).__name__}")
+        print(f"Wrapper type: {type(model_wrapper).__name__}")
+        print_model_structure(model)
     
     dtype_map = {
         'qint8': torch.qint8,
         'quint8': torch.quint8
     }
-    torch_dtype = dtype_map[args.dtype]
+    torch_dtype = dtype_map[dtype]
     
     quantizer = SelectiveQuantizer(
-        quantization_mode=args.mode,
+        quantization_mode=mode,
         dtype=torch_dtype,
-        weight_bits=args.weight_bits,
-        activation_bits=args.activation_bits
+        weight_bits=weight_bits,
+        activation_bits=activation_bits
     )
     
-    print(f"\nApplying {args.mode} quantization...")
+    print(f"\nApplying {mode} quantization...")
     quantized_model = quantizer.quantize(model)
     print("Quantization completed successfully!")
 
-    
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    print(f"\nSaving quantized model to: {output_path}")
-    quantized_model.to('cpu')
-    torch.save(quantized_model, output_path)
-    print("\nQuantization script completed!")
-
-
-if __name__ == "__main__":
-    main()
-
+    return quantized_model

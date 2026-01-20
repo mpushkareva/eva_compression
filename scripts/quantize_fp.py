@@ -244,138 +244,28 @@ def print_layer_analysis(layer_groups: Dict[str, List[str]]):
                 print(f"  ... and {len(names) - 10} more")
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Quantize EVA-transformer model using QPyTorch wrapper approach"
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        help="HuggingFace model ID or local path to EVA model"
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        required=True,
-        help="Output path to save quantized model"
-    )
-    parser.add_argument(
-        "--num-labels",
-        type=int,
-        default=1000,
-        help="Number of classification labels (default: 1000 for ImageNet)"
-    )
-    # Set defaults for layer quantization (enabled by default for most layers)
-    parser.set_defaults(
-        quantize_attention=False,
-        quantize_mlp=False,
-        quantize_embedding=False,
-        quantize_norm=False,
-        quantize_head=False
-    )
-    
-    parser.add_argument(
-        "--quantize-attention",
-        dest="quantize_attention",
-        action="store_true",
-        help="Quantize attention layers (default: disabled)"
-    )
-    parser.add_argument(
-        "--quantize-mlp",
-        dest="quantize_mlp",
-        action="store_true",
-        help="Quantize MLP/feed-forward layers (default: disabled)"
-    )
-    parser.add_argument(
-        "--quantize-embedding",
-        dest="quantize_embedding",
-        action="store_true",
-        help="Quantize embedding layers (default: disabled)"
-    )
-    parser.add_argument(
-        "--quantize-norm",
-        dest="quantize_norm",
-        action="store_true",
-        help="Quantize normalization layers (default: disabled)"
-    )
-    parser.add_argument(
-        "--quantize-head",
-        dest="quantize_head",
-        action="store_true",
-        help="Quantize classification head (default: disabled)"
-    )
-    parser.add_argument(
-        "--quantize-all",
-        action="store_true",
-        help="Quantize all layer types (overrides individual flags, default: disabled)"
-    )
-    # QPyTorch specific parameters
-    parser.add_argument(
-        "--forward-wl",
-        type=int,
-        default=8,
-        help="Forward quantization word length for FixedPoint (default: 8)"
-    )
-    parser.add_argument(
-        "--forward-fl",
-        type=int,
-        default=4,
-        help="Forward quantization fractional length for FixedPoint (default: 2)"
-    )
-    parser.add_argument(
-        "--forward-exp",
-        type=int,
-        default=4,
-        help="Forward quantization exponent bits for FloatingPoint (default: 5)"
-    )
-    parser.add_argument(
-        "--forward-man",
-        type=int,
-        default=4,
-        help="Forward quantization mantissa bits for FloatingPoint (default: 2)"
-    )
-    parser.add_argument(
-        "--backward-exp",
-        type=int,
-        default=5,
-        help="Backward quantization exponent bits for FloatingPoint (default: 5)"
-    )
-    parser.add_argument(
-        "--backward-man",
-        type=int,
-        default=2,
-        help="Backward quantization mantissa bits for FloatingPoint (default: 2)"
-    )
-    parser.add_argument(
-        "--forward-rounding",
-        type=str,
-        default="nearest",
-        choices=["nearest", "stochastic"],
-        help="Forward rounding mode (default: nearest)"
-    )
-    parser.add_argument(
-        "--backward-rounding",
-        type=str,
-        default="nearest",
-        choices=["nearest", "stochastic"],
-        help="Backward rounding mode (default: nearest)"
-    )
-    parser.add_argument(
-        "--analyze-only",
-        action="store_true",
-        help="Only analyze layer types without quantizing"
-    )
-    parser.add_argument(
-        "--token",
-        type=str,
-        default=None,
-        help="HuggingFace token (optional)"
-    )
-    
-    args = parser.parse_args()
-    
-    if args.quantize_all:
+def quantize_fp(
+    model_name_or_path: str,
+    num_labels: int = 1000,
+    attention: bool = False,
+    mlp: bool = False,
+    embedding: bool = False,
+    norm: bool = False,
+    head: bool = False,
+    other: bool = False,
+    quantize_all: bool = False,
+    forward_format: str = "fixed",
+    forward_wl: int = 8,
+    forward_fl: int = 2,
+    forward_exp: int = 5,
+    forward_man: int = 2,
+    backward_exp: int = 5,
+    backward_man: int = 2,
+    forward_rounding: str = "nearest",
+    backward_rounding: str = "nearest",
+    verbose: bool = False,
+    ):
+    if quantize_all:
         quantize_config = {
             'attention': True,
             'mlp': True,
@@ -386,35 +276,25 @@ def main():
         }
     else:
         quantize_config = {
-            'attention': getattr(args, 'quantize_attention', True),
-            'mlp': getattr(args, 'quantize_mlp', True),
-            'embedding': getattr(args, 'quantize_embedding', True),
-            'norm': getattr(args, 'quantize_norm', False),
-            'head': getattr(args, 'quantize_head', True),
-            'other': False
+            'attention': attention,
+            'mlp': mlp,
+            'embedding': embedding,
+            'norm': norm,
+            'head': head,
+            'other': other
         }
-    
-    print(f"Loading model from: {args.model}")
-    model_wrapper = load_eva_model(args.model, args.num_labels, args.token, return_wrapper=True)
-    model_wrapper.eval()
-    
-    if hasattr(model_wrapper, 'model'):
-        model = model_wrapper.model
-    elif hasattr(model_wrapper, 'timm_model'):
-        model = model_wrapper.timm_model
-    else:
-        model = model_wrapper
-    
+
+    print(f"Loading model from: {model_name_or_path}")
+    model = load_eva_model(model_name_or_path, num_labels)
     model.eval()
-    print(f"Model type: {type(model).__name__}")
-    print(f"Wrapper type: {type(model_wrapper).__name__}")
     
-    print_model_structure(model)
+    if verbose:
+        print_model_structure(model)
+        layer_groups = analyze_layer_types(model)
+        print_layer_analysis(layer_groups)
+
     
-    layer_groups = analyze_layer_types(model)
-    print_layer_analysis(layer_groups)
-    
-    if args.analyze_only:
+    if verbose:
         print("\nAnalysis complete. Exiting without quantization.")
         return
     
@@ -424,41 +304,27 @@ def main():
         return
     
     # Create number formats for QPyTorch
-    if args.forward_format == "fixed":
-        forward_num = FixedPoint(wl=args.forward_wl, fl=args.forward_fl)
-        print(f"Forward format: FixedPoint(wl={args.forward_wl}, fl={args.forward_fl})")
+    if forward_format == "fixed":
+        forward_num = FixedPoint(wl=forward_wl, fl=forward_fl)
+        print(f"Forward format: FixedPoint(wl={forward_wl}, fl={forward_fl})")
     else:
-        forward_num = FloatingPoint(exp=args.forward_exp, man=args.forward_man)
-        print(f"Forward format: FloatingPoint(exp={args.forward_exp}, man={args.forward_man})")
+        forward_num = FloatingPoint(exp=forward_exp, man=forward_man)
+        print(f"Forward format: FloatingPoint(exp={forward_exp}, man={forward_man})")
     
-    backward_num = FloatingPoint(exp=args.backward_exp, man=args.backward_man)
-    print(f"Backward format: FloatingPoint(exp={args.backward_exp}, man={args.backward_man})")
+    backward_num = FloatingPoint(exp=backward_exp, man=backward_man)
+    print(f"Backward format: FloatingPoint(exp={backward_exp}, man={backward_man})")
     
     quantizer = QPyTorchQuantizer(
         quantize_config=quantize_config,
         forward_num=forward_num,
         backward_num=backward_num,
-        forward_rounding=args.forward_rounding,
-        backward_rounding=args.backward_rounding
+        forward_rounding=forward_rounding,
+        backward_rounding=backward_rounding
     )
     
     quantized_model = quantizer.quantize_model(model)
-    print(f"Quantization for {args.model} completed successfully!")
+    print(f"Quantization for {model_name_or_path} completed successfully!")
     
-    # if hasattr(model_wrapper, 'model'):
-    #     model_wrapper.model = quantized_model
-    # elif hasattr(model_wrapper, 'timm_model'):
-    #     model_wrapper.timm_model = quantized_model
-    # else:
-    #     model_wrapper = quantized_model
-    
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    print(f"\nSaving quantized model to: {output_path}")
-    torch.save(quantized_model, output_path)
-    print("\nQuantization script completed!")
+    return quantized_model
 
-if __name__ == "__main__":
-    main()
 

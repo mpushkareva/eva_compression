@@ -7,6 +7,7 @@ import os
 
 
 # Standard ImageNet normalization
+
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
@@ -46,7 +47,7 @@ def get_image_train_transform(
     )
     return transforms.Compose(t)
 
-
+# TODO: make transofration optional
 def get_image_val_transform(
     img_size: int = 224,
     eval_resize: int = 256,
@@ -60,8 +61,8 @@ def get_image_val_transform(
         normalize: If False, skip normalization (useful when pipeline handles normalization)
     """
     t = [
-        transforms.Resize(eval_resize),
-        transforms.CenterCrop(img_size),
+        # transforms.Resize(eval_resize),
+        # transforms.CenterCrop(img_size),
         transforms.ToTensor(),
     ]
     if normalize:

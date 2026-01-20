@@ -262,100 +262,21 @@ def print_layer_analysis(layer_groups: Dict[str, List[str]]):
                 print(f"  ... and {len(names) - 10} more")
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Manually quantize EVA-transformer model weights to int8 with float scales"
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        help="HuggingFace model ID or local path to EVA model"
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        required=True,
-        help="Output path to save quantized weights and scales"
-    )
-    parser.add_argument(
-        "--num-labels",
-        type=int,
-        default=1000,
-        help="Number of classification labels (default: 1000 for ImageNet)"
-    )
-    # Set defaults for layer quantization (enabled by default for most layers)
-    parser.set_defaults(
-        quantize_attention=False,
-        quantize_mlp=False,
-        quantize_embedding=False,
-        quantize_norm=False,
-        quantize_head=False
-    )
-    
-    parser.add_argument(
-        "--quantize-attention",
-        dest="quantize_attention",
-        action="store_true",
-        help="Quantize attention layers (default: disabled)"
-    )
-    parser.add_argument(
-        "--quantize-mlp",
-        dest="quantize_mlp",
-        action="store_true",
-        help="Quantize MLP/feed-forward layers (default: disabled)"
-    )
-    parser.add_argument(
-        "--no-quantize-mlp",
-        dest="quantize_mlp",
-        action="store_false",
-        help="Disable quantization of MLP/feed-forward layers"
-    )
-    parser.add_argument(
-        "--quantize-embedding",
-        dest="quantize_embedding",
-        action="store_true",
-        help="Quantize embedding layers (default: disabled)"
-    )
-    parser.add_argument(
-        "--quantize-norm",
-        dest="quantize_norm",
-        action="store_true",
-        help="Quantize normalization layers (default: disabled)"
-    )
-    parser.add_argument(
-        "--quantize-head",
-        dest="quantize_head",
-        action="store_true",
-        help="Quantize classification head (default: disabled)"
-    )
-    parser.add_argument(
-        "--quantize-all",
-        action="store_true",
-        help="Quantize all layer types (overrides individual flags, default: disabled)"
-    )
-    parser.add_argument(
-        "--per-channel",
-        action="store_true",
-        help="Use per-channel quantization (more accurate but larger scale storage)"
-    )
-    parser.add_argument(
-        "--analyze-only",
-        action="store_true",
-        help="Only analyze layer types without quantizing"
-    )
-    parser.add_argument(
-        "--token",
-        type=str,
-        default=None,
-        help="HuggingFace token (optional)"
-    )
-    
-    args = parser.parse_args()
-    
-    # Build quantization config
-    if args.quantize_all:
-        # Quantize everything
+def quantize_manual(
+    model_name_or_path: str,
+    num_labels: int = 1000,
+    attention: bool = False,
+    mlp: bool = False,
+    embedding: bool = False,
+    norm: bool = False,
+    head: bool = False,
+    other: bool = False,
+    quantize_all: bool = False,
+    dtype: str = 'qint8',
+    per_channel: bool = False,
+    verbose: bool = False,
+):   
+    if quantize_all:
         quantize_config = {
             'attention': True,
             'mlp': True,
@@ -365,42 +286,26 @@ def main():
             'other': True
         }
     else:
-        # Use individual flags with defaults
         quantize_config = {
-            'attention': getattr(args, 'quantize_attention', True),
-            'mlp': getattr(args, 'quantize_mlp', True),
-            'embedding': getattr(args, 'quantize_embedding', True),
-            'norm': getattr(args, 'quantize_norm', False),
-            'head': getattr(args, 'quantize_head', True),
-            'other': False
+            'attention': attention,
+            'mlp': mlp,
+            'embedding': embedding,
+            'norm': norm,
+            'head': head,
+            'other': other
         }
     
+    
     # Load model (same way as eval_classification.py)
-    print(f"Loading model from: {args.model}")
-    model_wrapper = load_eva_model(args.model, args.num_labels, args.token, return_wrapper=True)
-    model_wrapper.eval()
-    
-    if hasattr(model_wrapper, 'model'):
-        model = model_wrapper.model
-    elif hasattr(model_wrapper, 'timm_model'):
-        model = model_wrapper.timm_model
-    else:
-        model = model_wrapper
-    
+    print(f"Loading model from: {model_name_or_path}")
+    model = load_eva_model(model_name_or_path, num_labels)
     model.eval()
-    print(f"Model type: {type(model).__name__}")
-    print(f"Wrapper type: {type(model_wrapper).__name__}")
     
     # Print model structure
-    print_model_structure(model)
-    
-    # Analyze layer types
-    layer_groups = analyze_layer_types(model)
-    print_layer_analysis(layer_groups)
-    
-    if args.analyze_only:
-        print("\nAnalysis complete. Exiting without quantization.")
-        return
+    if verbose:
+        print_model_structure(model)
+        layer_groups = analyze_layer_types(model)
+        print_layer_analysis(layer_groups)
     
     # Check if any layer type is selected for quantization
     if not any(quantize_config.values()):
@@ -412,78 +317,18 @@ def main():
     for layer_type, enabled in quantize_config.items():
         status = "ENABLED" if enabled else "DISABLED"
         print(f"  {layer_type}: {status}")
-    print(f"Quantization dtype: {args.dtype}")
-    print(f"Per-channel: {args.per_channel}")
+    print(f"Quantization dtype: {dtype}")
+    print(f"Per-channel: {per_channel}")
     
     # Create quantizer
     quantizer = ManualQuantizer(
         quantize_config=quantize_config,
-        dtype=args.dtype,
-        per_channel=args.per_channel
+        dtype=dtype,
+        per_channel=per_channel
     )
     
-    # Apply manual quantization
-    print(f"\nApplying manual quantization...")
-    try:
-        quantized_weights, scales = quantizer.quantize_model(model)
-        print(f"Quantization completed successfully! Quantized {len(quantized_weights)} weight tensors.")
-    except Exception as e:
-        print(f"Error during quantization: {e}")
-        import traceback
-        traceback.print_exc()
-        return
-    
-    # Save quantized weights and scales
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Save quantized weights (int8)
-    weights_path = output_path.with_suffix('.weights.pth')
-    print(f"\nSaving quantized int8 weights to: {weights_path}")
-    torch.save(quantized_weights, weights_path)
-    
-    # Save scales (float)
-    scales_path = output_path.with_suffix('.scales.pth')
-    print(f"Saving float scales to: {scales_path}")
-    torch.save(scales, scales_path)
-    
-    # Save metadata (quantization config and info)
-    metadata = {
-        'quantize_config': quantize_config,
-        'dtype': args.dtype,
-        'per_channel': args.per_channel,
-        'num_quantized_tensors': len(quantized_weights),
-        'model_name': args.model,
-    }
-    metadata_path = output_path.with_suffix('.metadata.pth')
-    print(f"Saving metadata to: {metadata_path}")
-    torch.save(metadata, metadata_path)
-    
-    # Print summary
-    print(f"\n=== Quantization Summary ===")
-    print(f"Quantized weights saved to: {weights_path}")
-    print(f"Scales saved to: {scales_path}")
-    print(f"Metadata saved to: {metadata_path}")
-    print(f"Total quantized tensors: {len(quantized_weights)}")
-    
-    # Calculate size reduction
-    total_float_size = sum(w.numel() * 4 for w in quantized_weights.values())  # 4 bytes per float32
-    total_int8_size = sum(w.numel() * 1 for w in quantized_weights.values())  # 1 byte per int8
-    total_scale_size = sum(
-        (s.numel() if isinstance(s, torch.Tensor) else 1) * 4 
-        for s in scales.values()
-    )  # 4 bytes per float32 scale
-    
-    print(f"\nSize comparison:")
-    print(f"  Original (float32): {total_float_size / 1024 / 1024:.2f} MB")
-    print(f"  Quantized (int8): {total_int8_size / 1024 / 1024:.2f} MB")
-    print(f"  Scales (float32): {total_scale_size / 1024 / 1024:.2f} MB")
-    print(f"  Total quantized: {(total_int8_size + total_scale_size) / 1024 / 1024:.2f} MB")
-    print(f"  Compression ratio: {total_float_size / (total_int8_size + total_scale_size):.2f}x")
-    
-    print("\nManual quantization script completed!")
-
-
-if __name__ == "__main__":
-    main()
+    # TODO: create class with forward and backward pass that quantized weights and scales
+    quantized_weights, scales = quantizer.quantize_model(model)
+    quantized_model = ...
+    return quantized_model
 

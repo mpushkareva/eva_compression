@@ -1,12 +1,16 @@
 import argparse
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Optional
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from transformers import AutoImageProcessor
 
+from scripts.quantize_fp import quantize_fp
+from scripts.quantize_manual import quantize_manual
+from scripts.quantize_torch import quantize_torch
 from utils.dataloaders.image_dataloaders import get_imagenet_dataloaders
 
 
@@ -29,23 +33,27 @@ def accuracy_from_logits(
     return res
 
 
-def load_quantized_model(model_path: str, device: str) -> nn.Module:
-    model_path = Path(model_path)
-    
-    print(f"Loading quantized model from: {model_path}")
-    model = torch.load(model_path, map_location=device)
-    
-    model.eval()
-    model.to(device)
-    print("Model loaded successfully!")
-    return model
+def _get_hf_token(token: str = None) -> Optional[str]:
+    """Get HuggingFace token from argument, environment, or cache."""
+    import os
+    if token:
+        return token
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    if token:
+        return token
+    try:
+        from huggingface_hub import HfFolder
+        return HfFolder.get_token()
+    except Exception:
+        return None
 
 
 def evaluate_model(
     model: nn.Module,
     val_loader: DataLoader,
     device: str,
-    num_classes: int = 1000
+    num_classes: int = 1000,
+    image_processor: Optional[AutoImageProcessor] = None
 ) -> Tuple[float, float, int]:
     top1_sum = 0.0
     top5_sum = 0.0
@@ -53,13 +61,31 @@ def evaluate_model(
 
     model.eval()
     
+    # Use image processor if provided, otherwise use direct tensor input
+    # use_image_processor = image_processor is not None
+    # if use_image_processor:
+    #     import torchvision.transforms as T
+    #     to_pil = T.ToPILImage()
+    
     with torch.no_grad():
         for batch_idx, (images, targets) in enumerate(tqdm(val_loader, desc="Evaluating", unit="batch")):
             batch_size = targets.size(0)
             
-            images = images.to(device)
+            # if use_image_processor:
+            # Process images through image processor
+            processed_images = []
+            for img in images:
+                # img_pil = to_pil(img.cpu())
+                # inputs = image_processor(img_pil, return_tensors="pt")
+                inputs = image_processor(img, return_tensors="pt")
+                pixel_values = inputs['pixel_values']
+                processed_images.append(pixel_values)
+            
+            images = torch.cat(processed_images, dim=0).to(device)
+            # else:
+            #     images = images.to(device)
+            
             targets = targets.to(device)
-                    
             logits = model(images)
             logits = logits.cpu()
             targets = targets.cpu()
@@ -121,40 +147,82 @@ def parse_args():
         help="Device to run evaluation on (default: cuda if available, else cpu)"
     )
     parser.add_argument(
-        "--img-size",
-        type=int,
-        default=224,
-        help="Input image size (default: 224)"
-    )
-    parser.add_argument(
-        "--eval-resize",
-        type=int,
-        default=256,
-        help="Resize size before center crop (default: 256)"
-    )
-    parser.add_argument(
         "--num-classes",
         type=int,
         default=1000,
         help="Number of classes (default: 1000 for ImageNet)"
+    )
+    parser.add_argument(
+        "--quant_type",
+        type=str,
+        default="torch",
+        choices=["torch", 'fixed', 'manual'],
+        help="Quantize EVA model"
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="dynamic",
+        help="Quantization mode (default: dynamic)"
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="qint8",
+        help="Quantization dtype (default: qint8)"
+    )
+    parser.add_argument(
+        "--weight-bits",
+        type=int,
+        default=8,
+        help="Quantization weight bits (default: 8)"
+    )
+    parser.add_argument(
+        "--activation-bits",
+        type=int,
+        default=8,
+        help="Quantization activation bits (default: 8)"
+    )
+    parser.add_argument(
+        "--base-model",
+        type=str,
+        default=None,
+        help="HF model id or local path for image processor (e.g., 'timm/eva02_base_patch14_224.mim_in22k'). "
+             "If provided, will use HF image processor for preprocessing."
+    )
+    parser.add_argument(
+        "--token",
+        type=str,
+        default=None,
+        help="Hugging Face token (optional, will try env vars and HF cache if not provided)."
     )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-            
-    model = load_quantized_model(args.model, args.device)
+
+    if args.quant_type == "torch":
+        model = quantize_torch(args.model, args.num_classes, args.mode, args.dtype, args.weight_bits, args.activation_bits)
+    elif args.quant_type == "fp":
+        model = quantize_fp(args.model, args.num_classes, args.attention, args.mlp, args.embedding, args.norm, args.head, args.other, args.quantize_all, args.forward_format, args.forward_wl, args.forward_fl, args.forward_exp, args.forward_man, args.backward_exp, args.backward_man, args.forward_rounding, args.backward_rounding)
+    elif args.quant_type == "manual":
+        model = quantize_manual(args.model, args.num_classes, args.attention, args.mlp, args.embedding, args.norm, args.head, args.other, args.quantize_all)
+    else:
+        raise NotImplementedError("Only torch and fp quantization are supported for now")
+    
+    token = _get_hf_token(args.token)
+    print(f"Loading image processor from: {args.model}")
+    image_processor = AutoImageProcessor.from_pretrained(args.model, token=token)
+    print("Image processor loaded successfully!")
     
     _, val_loader = get_imagenet_dataloaders(
         val_dir=args.val_dir,
         train_dir=None,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        img_size=args.img_size,
-        eval_resize=args.eval_resize,
         use_randaug=False,
-        normalize=True,  # Normalize in dataloader since we're not using pipeline
+        normalize=False,
     )
     
     if hasattr(val_loader.dataset, 'classes'):
@@ -168,7 +236,8 @@ def main():
         model=model,
         val_loader=val_loader,
         device=args.device,
-        num_classes=num_classes
+        num_classes=num_classes,
+        image_processor=image_processor
     )
     
     print(f"\n{'='*60}")
