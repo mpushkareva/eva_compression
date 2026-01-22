@@ -303,7 +303,6 @@ def quantize_fp(
         print("Use --quantize-* flags or --quantize-all to enable quantization.")
         return
     
-    # Create number formats for QPyTorch
     if forward_format == "fixed":
         forward_num = FixedPoint(wl=forward_wl, fl=forward_fl)
         print(f"Forward format: FixedPoint(wl={forward_wl}, fl={forward_fl})")

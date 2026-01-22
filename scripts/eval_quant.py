@@ -195,6 +195,95 @@ def parse_args():
         type=str,
         default=None,
         help="Hugging Face token (optional, will try env vars and HF cache if not provided)."
+    ) 
+    parser.add_argument(
+        "--attention",
+        action='store_true',
+        help="Quantize attention layers"
+    )
+    parser.add_argument(
+        "--mlp",
+        action='store_true',
+        help="Quantize MLP layers"
+    )
+    parser.add_argument(
+        "--embedding",
+        action='store_true',
+        help="Quantize embedding layers"
+    )
+    parser.add_argument(
+        "--norm",
+        action='store_true',
+        help="Quantize normalization layers"
+    )
+    parser.add_argument(
+        "--head",
+        action='store_true',
+        help="Quantize head layers"
+    )
+    parser.add_argument(
+        "--other",
+        action='store_true',
+        help="Quantize other layers"
+    )
+    parser.add_argument(
+        "--quantize_all",
+        action='store_true',
+        help="Quantize all layers"
+    )
+    parser.add_argument(
+        "--forward-format",
+        type=str,
+        default="fixed",
+        help="Forward format (default: fixed)"
+    )
+    parser.add_argument(
+        "--forward-wl",
+        type=int,
+        default=8,
+        help="Forward word length (default: 8)"
+    )
+    parser.add_argument(
+        "--forward-fl",
+        type=int,
+        default=4,
+        help="Forward fraction length (default: 2)"
+    )
+    parser.add_argument(
+        "--forward-exp",
+        type=int,
+        default=5,
+        help="Forward exponent (default: 5)"
+    )
+    parser.add_argument(
+        "--forward-man",
+        type=int,
+        default=1,
+        help="Forward mantissa (default: 1)"
+    )
+    parser.add_argument(
+        "--backward-exp",
+        type=int,
+        default=5,
+        help="Backward exponent (default: 5)"
+    )
+    parser.add_argument(
+        "--backward-man",
+        type=int,
+        default=1,
+        help="Backward mantissa (default: 1)"
+    )
+    parser.add_argument(
+        "--forward-rounding",
+        type=str,
+        default="nearest",
+        help="Forward rounding (default: nearest)"
+    )
+    parser.add_argument(
+        "--backward-rounding",
+        type=str,
+        default="nearest",
+        help="Backward rounding (default: nearest)"
     )
     return parser.parse_args()
 
@@ -204,7 +293,7 @@ def main():
 
     if args.quant_type == "torch":
         model = quantize_torch(args.model, args.num_classes, args.mode, args.dtype, args.weight_bits, args.activation_bits)
-    elif args.quant_type == "fp":
+    elif args.quant_type == "fixed":
         model = quantize_fp(args.model, args.num_classes, args.attention, args.mlp, args.embedding, args.norm, args.head, args.other, args.quantize_all, args.forward_format, args.forward_wl, args.forward_fl, args.forward_exp, args.forward_man, args.backward_exp, args.backward_man, args.forward_rounding, args.backward_rounding)
     elif args.quant_type == "manual":
         model = quantize_manual(args.model, args.num_classes, args.attention, args.mlp, args.embedding, args.norm, args.head, args.other, args.quantize_all)

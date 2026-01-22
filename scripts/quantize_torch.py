@@ -12,6 +12,7 @@ from copy import deepcopy
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Type
+from timm.models.eva import EvaAttention
 import torch
 import torch.nn as nn
 from torchao.quantization import (
@@ -31,46 +32,6 @@ from transformers import AutoImageProcessor, TimmWrapperForImageClassification
 
 GROUP_SIZE = 32
 
-#  EvaAttention
-#       blocks.0.attn.qkv: Linear
-#       blocks.0.attn.q_norm: Identity
-#       blocks.0.attn.k_norm: Identity
-#       blocks.0.attn.attn_drop: Dropout
-#       blocks.0.attn.norm: Identity
-#       blocks.0.attn.proj: Linear
-#       blocks.0.attn.proj_drop: Dropout
-
-class EvaAttentionQuantized(nn.Module):
-    def __init__(self, in_features: int):
-        super().__init__()
-        self.q_linear = nn.Linear(in_features=in_features, out_features=in_features)
-        self.k_linear = nn.Linear(in_features=in_features, out_features=in_features)
-        self.v_linear = nn.Linear(in_features=in_features, out_features=in_features)
-        self.q_norm = nn.Identity()
-        self.k_norm = nn.Identity()
-        self.attn_drop = nn.Dropout()
-        self.norm = nn.Identity()
-        self.proj = nn.Linear(in_features=in_features, out_features=in_features * 3)
-        self.proj_drop = nn.Dropout()
-
-    def _copy_weights(self, qkv_module: nn.Module):
-        self.q_linear.weight.data = qkv_module.q_linear.weight.data
-        self.q_linear.bias.data = qkv_module.q_linear.bias.data
-        self.k_linear.weight.data = qkv_module.k_linear.weight.data
-        self.k_linear.bias.data = qkv_module.k_linear.bias.data
-        self.v_linear.weight.data = qkv_module.v_linear.weight.data
-        self.v_linear.bias.data = qkv_module.v_linear.bias.data
-        self.proj.weight.data = qkv_module.proj.weight.data
-        self.proj.bias.data = qkv_module.proj.bias.data
-        self.proj_drop.bias.data = qkv_module.proj_drop.bias.data
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        q = self.q_norm(self.q_linear(x))
-        k = self.k_norm(self.k_linear(x))
-        v = self.v_norm(self.v_linear(x))
-        attn = self.attn_drop(q @ k.transpose(-2, -1))
-        attn = self.norm(attn)
-        return self.proj(attn)
 
 class SelectiveQuantizer:
     
@@ -91,7 +52,6 @@ class SelectiveQuantizer:
         
         quantized_model = deepcopy(model)
 
-        
         # Collect modules to quantize with their parent info
         module_info = {}
         for name, module in quantized_model.named_modules():
@@ -123,11 +83,6 @@ class SelectiveQuantizer:
                 parent = quantized_model
 
             group_size = info['module'].weight.size(1)
-            if info['attr_name'] == 'qkv':
-                module = EvaAttentionQuantized(in_features=group_size)
-                module._copy_weights(info['module'])
-                setattr(parent, info['attr_name'], module)
-                continue
             
             if self.weight_bits == 4:
                 quantize_(info['module'], Int4WeightOnlyConfig(group_size=group_size))
@@ -171,6 +126,79 @@ class SelectiveQuantizer:
         else:
             raise ValueError(f"Unknown quantization mode: {self.quantization_mode}")
 
+    def convert_eva_attention_to_split_qkv(self, model: nn.Module) -> nn.Module:
+        converted_model = deepcopy(model)
+        for i in range(len(converted_model.blocks)):
+            old_attn = model.blocks[i].attn
+            new_attn = converted_model.blocks[i].attn
+            
+            # Get device and dtype from original weights
+            device = old_attn.qkv.weight.device
+            dtype = old_attn.qkv.weight.dtype
+            
+            # Detect if original has qk_norm, scale_norm, and qkv_bias
+            has_qk_norm = hasattr(old_attn, 'q_norm') and not isinstance(old_attn.q_norm, nn.Identity)
+            has_scale_norm = hasattr(old_attn, 'norm') and not isinstance(old_attn.norm, nn.Identity)
+            has_qkv_bias = old_attn.q_bias is not None
+            
+            # Create new attention module with split QKV
+            new_attn = EvaAttention(
+                dim=old_attn.qkv.weight.size(1),
+                num_heads=old_attn.num_heads,
+                qkv_bias=has_qkv_bias,
+                qkv_fused=False,
+                qkv_bias_separate=old_attn.qkv_bias_separate,
+                num_prefix_tokens=old_attn.num_prefix_tokens,
+                attn_drop=old_attn.attn_drop.p,
+                proj_drop=old_attn.proj_drop.p,
+                attn_head_dim=None,
+                norm_layer=type(old_attn.q_norm) if has_qk_norm else None,
+                qk_norm=has_qk_norm,
+                scale_norm=has_scale_norm,
+                rotate_half=old_attn.rotate_half,
+                device=device,
+                dtype=dtype
+            )
+            
+            # Split QKV weights
+            q_proj_weights, k_proj_weights, v_proj_weights = torch.chunk(old_attn.qkv.weight, 3, dim=0)
+            
+            # Transfer QKV projection weights
+            with torch.no_grad():
+                new_attn.q_proj.weight.copy_(q_proj_weights)
+                new_attn.k_proj.weight.copy_(k_proj_weights)
+                new_attn.v_proj.weight.copy_(v_proj_weights)
+                
+                # Transfer QKV biases if they exist
+                if has_qkv_bias:
+                    attn_dim = q_proj_weights.size(0)
+                    new_attn.q_proj.bias.copy_(old_attn.q_bias)
+                    # k_bias is always zero, but v_bias needs to be transferred
+                    new_attn.v_proj.bias.copy_(old_attn.v_bias)
+                
+                # Transfer output projection weights
+                new_attn.proj.weight.copy_(old_attn.proj.weight)
+                if old_attn.proj.bias is not None:
+                    new_attn.proj.bias.copy_(old_attn.proj.bias)
+                
+                # Transfer normalization layer weights if they exist
+                if has_qk_norm:
+                    new_attn.q_norm.weight.copy_(old_attn.q_norm.weight)
+                    if old_attn.q_norm.bias is not None:
+                        new_attn.q_norm.bias.copy_(old_attn.q_norm.bias)
+                    new_attn.k_norm.weight.copy_(old_attn.k_norm.weight)
+                    if old_attn.k_norm.bias is not None:
+                        new_attn.k_norm.bias.copy_(old_attn.k_norm.bias)
+                
+                if has_scale_norm:
+                    new_attn.norm.weight.copy_(old_attn.norm.weight)
+                    if old_attn.norm.bias is not None:
+                        new_attn.norm.bias.copy_(old_attn.norm.bias)
+            
+            # Assign the new attention module
+            converted_model.blocks[i].attn = new_attn
+
+        return converted_model
 
 def load_eva_model(
     model_name_or_path: str,
@@ -265,7 +293,8 @@ def quantize_torch(
         weight_bits=weight_bits,
         activation_bits=activation_bits
     )
-    
+    print("Converting EvaAttention to Split QKV")
+    model = quantizer.convert_eva_attention_to_split_qkv(model)
     print(f"\nApplying {mode} quantization...")
     quantized_model = quantizer.quantize(model)
     print("Quantization completed successfully!")
