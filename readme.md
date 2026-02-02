@@ -96,36 +96,6 @@ data/imagenet/
 
 ## Usage
 
-### Quantize EVA Models
-
-Quantize an EVA model with selective layer quantization:
-
-```bash
-python scripts/quantize_eva.py \
-  --model timm/eva02_base_patch14_224.mim_in22k \
-  --output checkpoints/quantized_eva.pth \
-  --mode dynamic \
-  --num-labels 1000
-```
-
-**Options:**
-- `--mode`: Quantization mode - `dynamic` (weights only), `static` (weights + activations), or `qat` (quantization-aware training)
-- `--quantize-attention`: Enable quantization of attention layers (default: enabled)
-- `--quantize-mlp`: Enable quantization of MLP layers (default: enabled)
-- `--quantize-embedding`: Enable quantization of embedding layers (default: enabled)
-- `--quantize-head`: Enable quantization of classification head (default: enabled)
-- `--bits`: Quantization bit-width (4 or 8, default: 8)
-- `--dtype`: Quantization dtype (`qint8` or `quint8`, default: `qint8`)
-
-**Example: Quantize only attention and MLP layers:**
-```bash
-python scripts/quantize_eva.py \
-  --model timm/eva02_base_patch14_224.mim_in22k \
-  --output checkpoints/quantized_eva.pth \
-  --mode dynamic \
-  --no-quantize-embedding \
-  --no-quantize-head
-```
 
 ### Evaluate Models
 
@@ -150,17 +120,6 @@ python scripts/eval_classification.py \
   --device cuda
 ```
 
-**Evaluate quantized model:**
-```bash
-python scripts/eval_classification.py \
-  --model timm/eva02_small_patch14_336.mim_in22k_ft_in1k \
-  --val-dir ./data/imagenet/val \
-  --dataset imagenet \
-  --quantized-model checkpoints/quantized_model.pth \
-  --device cuda
-```
-
-Note: The `--train-dir` parameter is optional. For evaluation purposes, you only need the validation set. The dataloader will work with just `--val-dir` specified.
 
 #### Evaluate on CIFAR-10:
 ```bash
@@ -183,73 +142,97 @@ python scripts/eval_classification.py \
 
 When using `--use-imagenet-labels`, CIFAR-10 labels are mapped to corresponding ImageNet class indices. This allows you to use ImageNet-trained models directly on CIFAR-10 data without fine-tuning. The model will output predictions for all 1000 ImageNet classes, and accuracy is computed based on the mapped ImageNet class indices.
 
-# TODO: check class labels after changes
 
-**CIFAR-10 to ImageNet mapping:**
-- airplane → airliner (class 404)
-- automobile → convertible (class 511)
-- bird → bird (class 80)
-- cat → tabby cat (class 281)
-- deer → elk (class 345)
-- dog → dog (class 151)
-- frog → tree frog (class 30)
-- horse → horse (class 340)
-- ship → container ship (class 510)
-- truck → pickup truck (class 609)
+Reading `eval_quant.py` to extract arguments, usage, and purpose for the README.
 
-### Batch Evaluation
 
-Evaluate all quantized models in the checkpoints directory:
+[2 tools called]
+
+
+Here’s a README you can use for `eval_quant.py`. In **Ask mode** I can’t create or edit files; you can paste this into `scripts/EVAL_QUANT_README.md` (or add it to the main `readme.md`), or switch to **Agent mode** if you want it written to a file automatically.
+
+---
+
+## `eval_quant.py` — Evaluate quantized EVA on ImageNet
+
+Evaluates quantized EVA (PyTorch) models on the ImageNet validation set. It loads a model by HuggingFace/timm id (or path), applies the chosen quantization backend in memory, runs validation with the model’s image processor, and reports Top-1 and Top-5 accuracy.
+
+### Requirements
+
+- ImageNet validation data organized by class (e.g. `./data/imagenet/val/n01440764/`, …).
+- `PYTHONPATH` set to the repo root when running the script (or run from repo root and set `PYTHONPATH=.`).
+
+### Basic usage
 
 ```bash
-python scripts/evaluate_all_models.py \
-  --base-model timm/eva02_small_patch14_336.mim_in22k_ft_in1k \
+# From repo root, with PYTHONPATH so scripts and utils resolve
+PYTHONPATH=. python scripts/eval_quant.py \
+  --model timm/eva02_tiny_patch14_336.mim_in22k_ft_in1k \
+  --val-dir ./data/imagenet/val
+```
+
+### Required arguments
+
+| Argument     | Description |
+|-------------|-------------|
+| `--model`   | HuggingFace/timm model id (e.g. `timm/eva02_tiny_patch14_336.mim_in22k_ft_in1k`) or path to a local model. Used for both loading weights and the image processor. |
+| `--val-dir` | Path to ImageNet validation directory (class subfolders, e.g. `./data/imagenet/val`). |
+
+### Quantization type: `--quant_type`
+
+Controls which quantization path is used (all run in memory; no separate “saved quantized file” is required for evaluation):
+
+| Value       | Description |
+|------------|-------------|
+| `torch`    | PyTorch dynamic/static quantization (`quantize_torch`). |
+| `fixed`    | Fixed-point quantization via `quantize_fp`. |
+| `fixed_op` | Fixed-point op-level quantization via `quantize_fp_op`. |
+| `manual`   | Manual quantization (`quantize_manual`). |
+| `origin`   | No quantization; load and evaluate the original model. |
+
+### Example: fixed-op quantization (matches your launch config)
+
+```bash
+PYTHONPATH=. python scripts/eval_quant.py \
+  --model timm/eva02_tiny_patch14_336.mim_in22k_ft_in1k \
   --val-dir ./data/imagenet/val \
-  --dataset imagenet \
-  --work-dir checkpoints \
-  --output-json checkpoints/evaluation_results.json \
-  --device cuda
+  --device cpu \
+  --quant_type fixed_op \
+  --quantize-all \
+  --forward-format fixed \
+  --forward-wl 16 \
+  --forward-fl 8
 ```
 
-**Options:**
-- `--work-dir`: Directory containing quantized model files (default: `checkpoints`)
-- `--output-json`: Path to save evaluation results (default: `checkpoints/evaluation_results.json`)
-- `--skip-base`: Skip evaluation of the base (non-quantized) model
+### Data and device
 
-### Build Results Table
+| Argument        | Default | Description |
+|----------------|--------|-------------|
+| `--val-dir`    | *(required)* | ImageNet validation root (class subfolders). |
+| `--batch-size` | `1`    | Batch size for evaluation. |
+| `--num-workers`| `4`    | DataLoader workers. |
+| `--device`     | `cuda` if available, else `cpu` | Device to run the model. |
+| `--num-classes`| `1000` | Number of classes (ImageNet-1k). |
 
-Generate a comparison table from evaluation results:
+### Quantization scope (for `fixed` / `fixed_op` / `manual`)
 
-```bash
-python scripts/build_results_table.py \
-  --input checkpoints/evaluation_results.json \
-  --output results_table.txt
-```
+- `--quantize-all` — quantize all supported layers (simplest).
+- Or choose modules: `--attention`, `--mlp`, `--embedding`, `--norm`, `--head`, `--other`.
 
-## Data Paths
+### Fixed-point format (for `fixed` and `fixed_op`)
 
-All scripts use the following default data paths:
-- **ImageNet validation**: `./data/imagenet/val`
-- **ImageNet training**: `./data/imagenet/train`
-- **CIFAR-10**: `./data/cifar-10-batches-py`
+- **Forward:** `--forward-format` (e.g. `fixed`), `--forward-wl`, `--forward-fl`, `--forward-exp`, `--forward-man`, `--forward-rounding`.
+- **Backward:** `--backward-exp`, `--backward-man`, `--backward-rounding`.
 
-You can override these paths using the `--val-dir` and `--train-dir` arguments.
+Typical example: `--forward-format fixed --forward-wl 16 --forward-fl 8`.
 
-## Model Checkpoints
+### PyTorch quantization (for `--quant_type torch`)
 
-Quantized models are saved to the `checkpoints/` directory by default. The quantization scripts create:
-- `*.pth`: Quantized model state dict
-- `*.wrapper.pth`: Full wrapper model (recommended for loading)
-- `*.metadata.pth`: Quantization metadata (for some quantization methods)
-- `*.scales.pth`: Quantization scales (for manual quantization)
+- `--mode` — e.g. `dynamic`.
+- `--dtype` — e.g. `qint8`.
+- `--weight-bits`, `--activation-bits` — bit width.
 
-When evaluating quantized models, use the `*.wrapper.pth` file with the `--quantized-model` argument.
+### HuggingFace
 
-## Notes
-
-- All scripts should be run from the project root directory
-- Make sure to set the `PYTHONPATH` if running scripts from other directories:
-  ```bash
-  export PYTHONPATH="${PYTHONPATH}:$(pwd)"
-  ```
-- For HuggingFace models, you may need to set a token via `--token` or environment variables (`HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN`)
+- `--base-model` — override model id/path used for the **image processor** (if different from `--model`).
+- `--token` — HuggingFace token; else uses `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`, or HF cache.

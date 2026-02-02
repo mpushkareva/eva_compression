@@ -8,9 +8,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoImageProcessor
 
-from scripts.quantize_fp import quantize_fp
-from scripts.quantize_manual import quantize_manual
-from scripts.quantize_torch import quantize_torch
+from scripts.quantize_torch import load_eva_model, quantize_torch
 from utils.dataloaders.image_dataloaders import get_imagenet_dataloaders
 
 
@@ -156,7 +154,7 @@ def parse_args():
         "--quant_type",
         type=str,
         default="torch",
-        choices=["torch", 'fixed', 'manual'],
+        choices=["torch", 'fixed', 'manual', 'origin', 'fixed_op'],
         help="Quantize EVA model"
     )
     parser.add_argument(
@@ -227,7 +225,7 @@ def parse_args():
         help="Quantize other layers"
     )
     parser.add_argument(
-        "--quantize_all",
+        "--quantize-all",
         action='store_true',
         help="Quantize all layers"
     )
@@ -294,11 +292,20 @@ def main():
     if args.quant_type == "torch":
         model = quantize_torch(args.model, args.num_classes, args.mode, args.dtype, args.weight_bits, args.activation_bits)
     elif args.quant_type == "fixed":
+        from scripts.quantize_fp import quantize_fp
         model = quantize_fp(args.model, args.num_classes, args.attention, args.mlp, args.embedding, args.norm, args.head, args.other, args.quantize_all, args.forward_format, args.forward_wl, args.forward_fl, args.forward_exp, args.forward_man, args.backward_exp, args.backward_man, args.forward_rounding, args.backward_rounding)
+    elif args.quant_type == "fixed_op":
+        from scripts.quantize_fixed_op import quantize_fp_op
+        model = quantize_fp_op(args.model, args.num_classes, args.attention, args.mlp, args.embedding, args.norm, args.head, args.other, args.quantize_all, args.forward_format, args.forward_wl, args.forward_fl, args.forward_exp, args.forward_man, args.backward_exp, args.backward_man, args.forward_rounding, args.backward_rounding)
     elif args.quant_type == "manual":
+        from scripts.quantize_manual import quantize_manual
         model = quantize_manual(args.model, args.num_classes, args.attention, args.mlp, args.embedding, args.norm, args.head, args.other, args.quantize_all)
+    elif args.quant_type == "origin":
+        print("Loading model from: {args.model}")
+        model = load_eva_model(args.model, args.num_classes)
+        model.eval()    
     else:
-        raise NotImplementedError("Only torch and fp quantization are supported for now")
+        raise NotImplementedError(f"Quantization type {args.quant_type} not supported")
     
     token = _get_hf_token(args.token)
     print(f"Loading image processor from: {args.model}")
