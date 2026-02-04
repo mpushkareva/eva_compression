@@ -1,2 +1,9 @@
 data/*
 __pycache__/*
+
+.vscode
+.DS_Store
+checkpoints/*
+cifar-10-batches-py
+*/__pycache__/*
+*/*/__pycache__/*
