@@ -27,5 +27,6 @@ basic tiny
 |fixed all, 16 bit, 8 fl| 80% | 95.2% |
 |fixed all, 12 bit, 6 fl| 53.4% | 78.3% |
 |fixed all, 8 bit, 4 fl| 0.14% | 0.61% |
+|fixed, 8 bit for attn, others 12| 0.14% | 0.61% |
 
 

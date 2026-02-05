@@ -297,30 +297,40 @@ class FixedPointModelConverter:
         quantize_config: Dict[str, bool],
         wl: int = 8,
         fl: int = 4,
-        rounding: str = "nearest"
+        rounding: str = "nearest",
+        precision_by_layer_type: Optional[Dict[str, Tuple[int, int]]] = None
     ):
         self.quantize_config = quantize_config
         self.layer_identifier = LayerTypeIdentifier()
-        self.fp_format = FixedPointFormat(wl=wl, fl=fl, rounding=rounding)
+        self.default_fp_format = FixedPointFormat(wl=wl, fl=fl, rounding=rounding)
+        self.format_by_layer_type: Dict[str, FixedPointFormat] = {}
+        if precision_by_layer_type:
+            for layer_type, (w, f) in precision_by_layer_type.items():
+                self.format_by_layer_type[layer_type] = FixedPointFormat(wl=w, fl=f, rounding=rounding)
+        
+    def _get_format_for_layer_type(self, layer_type: str) -> FixedPointFormat:
+        """Return fixed-point format for the given layer type (override or default)."""
+        return self.format_by_layer_type.get(layer_type, self.default_fp_format)
         
     def should_quantize(self, module_name: str, module: nn.Module) -> bool:
         """Check if this module should be converted to fixed-point."""
         layer_type = self.layer_identifier.identify_layer_type(module_name, module)
         return self.quantize_config.get(layer_type, False)
     
-    def convert_layer(self, module: nn.Module) -> Optional[nn.Module]:
+    def convert_layer(self, module: nn.Module, layer_type: str) -> Optional[nn.Module]:
         """
         Convert a standard layer to its fixed-point equivalent.
         Returns None if no conversion is available for this layer type.
         """
+        fp_format = self._get_format_for_layer_type(layer_type)
         if isinstance(module, nn.Linear):
-            return FixedPointLinear(module, self.fp_format)
+            return FixedPointLinear(module, fp_format)
         elif isinstance(module, nn.Conv2d):
-            return FixedPointConv2d(module, self.fp_format)
+            return FixedPointConv2d(module, fp_format)
         elif isinstance(module, nn.LayerNorm):
-            return FixedPointLayerNorm(module, self.fp_format)
+            return FixedPointLayerNorm(module, fp_format)
         elif isinstance(module, nn.Embedding):
-            return FixedPointEmbedding(module, self.fp_format)
+            return FixedPointEmbedding(module, fp_format)
         # Note: BatchNorm and GroupNorm can be added similarly if needed
         return None
     
@@ -333,8 +343,10 @@ class FixedPointModelConverter:
         # First pass: identify modules to replace
         for name, module in model.named_modules():
             if self.should_quantize(name, module):
-                converted = self.convert_layer(module)
+                layer_type = self.layer_identifier.identify_layer_type(name, module)
+                converted = self.convert_layer(module, layer_type)
                 if converted is not None:
+                    fp_format = self._get_format_for_layer_type(layer_type)
                     name_parts = name.split('.')
                     parent_name = '.'.join(name_parts[:-1]) if len(name_parts) > 1 else ''
                     attr_name = name_parts[-1]
@@ -343,7 +355,8 @@ class FixedPointModelConverter:
                         'parent_name': parent_name,
                         'attr_name': attr_name,
                         'replacement': converted,
-                        'original_type': type(module).__name__
+                        'original_type': type(module).__name__,
+                        'fp_format': fp_format
                     }
         
         # Second pass: perform replacements
@@ -357,7 +370,8 @@ class FixedPointModelConverter:
                 parent = model
             
             setattr(parent, info['attr_name'], info['replacement'])
-            print(f"Converted {name} ({info['original_type']}) -> FixedPoint (wl={self.fp_format.wl}, fl={self.fp_format.fl})")
+            fmt = info['fp_format']
+            print(f"Converted {name} ({info['original_type']}) -> FixedPoint (wl={fmt.wl}, fl={fmt.fl})")
         
         return model
 
@@ -436,6 +450,31 @@ def print_layer_analysis(layer_groups: Dict[str, List[str]]):
                 print(f"  ... and {len(names) - 10} more")
 
 
+def parse_precision_by_layer(tokens: List[str]) -> Dict[str, Tuple[int, int]]:
+    """
+    Parse per-layer precision from CLI tokens like 'attention:8,4' 'mlp:16,8'.
+    Returns dict mapping layer_type -> (wl, fl). Invalid tokens raise ValueError.
+    """
+    result: Dict[str, Tuple[int, int]] = {}
+    valid_types = {'attention', 'mlp', 'embedding', 'norm', 'head', 'other'}
+    for token in tokens:
+        if ':' not in token:
+            raise ValueError(f"Invalid precision token '{token}': expected layer_type:wl,fl")
+        layer_type, rest = token.split(':', 1)
+        layer_type = layer_type.strip().lower()
+        if layer_type not in valid_types:
+            raise ValueError(f"Unknown layer type '{layer_type}'; valid: {sorted(valid_types)}")
+        if ',' not in rest:
+            raise ValueError(f"Invalid precision token '{token}': expected layer_type:wl,fl")
+        wl_str, fl_str = rest.split(',', 1)
+        try:
+            wl, fl = int(wl_str.strip()), int(fl_str.strip())
+        except ValueError as e:
+            raise ValueError(f"Invalid wl,fl in '{token}': {e}") from e
+        result[layer_type] = (wl, fl)
+    return result
+
+
 def quantize_fp_op(
     model_name_or_path: str,
     num_labels: int = 1000,
@@ -456,12 +495,15 @@ def quantize_fp_op(
     forward_rounding: str = "nearest",
     backward_rounding: str = "nearest",
     verbose: bool = False,
+    precision_by_layer_type: Optional[Dict[str, Tuple[int, int]]] = None,
 ):
     """
     Quantize model to fixed-point representation.
     
     Args follow the signature from eval_quant.py.
     backward_* parameters are kept for API compatibility but not used in inference.
+    precision_by_layer_type: optional dict mapping layer type (e.g. 'attention', 'mlp')
+        to (wl, fl). Unspecified types use forward_wl/forward_fl.
     """
     # Build quantization config
     if quantize_all:
@@ -500,17 +542,22 @@ def quantize_fp_op(
     
     # Configure fixed-point format (only forward format is used for inference)
     if forward_format == "fixed":
-        print(f"Configuring FixedPoint(wl={forward_wl}, fl={forward_fl}, rounding={forward_rounding})")
+        print(f"Configuring FixedPoint default (wl={forward_wl}, fl={forward_fl}, rounding={forward_rounding})")
     else:
         print(f"Warning: forward_format={forward_format} not 'fixed', but proceeding with fixed-point")
         print(f"Using FixedPoint(wl={forward_wl}, fl={forward_fl})")
+    if precision_by_layer_type:
+        print("Per-layer precision overrides:")
+        for layer_type, (wl, fl) in sorted(precision_by_layer_type.items()):
+            print(f"  {layer_type}: wl={wl}, fl={fl}")
     
     # Create converter and transform model
     converter = FixedPointModelConverter(
         quantize_config=quantize_config,
         wl=forward_wl,
         fl=forward_fl,
-        rounding=forward_rounding
+        rounding=forward_rounding,
+        precision_by_layer_type=precision_by_layer_type
     )
     
     quantized_model = converter.convert_model(model)
@@ -528,24 +575,47 @@ if __name__ == "__main__":
     parser.add_argument("--num-labels", type=int, default=1000)
     parser.add_argument("--wl", type=int, default=8, help="Word length (total bits)")
     parser.add_argument("--fl", type=int, default=4, help="Fractional length")
+    parser.add_argument(
+        "--precision-by-layer",
+        type=str,
+        nargs="*",
+        default=None,
+        metavar="KEY:WL,FL",
+        help="Per-layer precision (e.g. attention:8,4 mlp:16,8). Unspecified types use --wl/--fl.",
+    )
+    parser.add_argument("--forward-rounding", type=str, default="nearest", help="Rounding mode")
     parser.add_argument("--quantize-all", action="store_true")
     parser.add_argument("--attention", action="store_true")
     parser.add_argument("--mlp", action="store_true")
+    parser.add_argument("--embedding", action="store_true")
+    parser.add_argument("--norm", action="store_true")
+    parser.add_argument("--head", action="store_true")
+    parser.add_argument("--other", action="store_true")
     parser.add_argument("--verbose", action="store_true")
-    
+
     args = parser.parse_args()
-    
-    model = quantize_fp(
+
+    precision_by_layer_type = None
+    if args.precision_by_layer:
+        precision_by_layer_type = parse_precision_by_layer(args.precision_by_layer)
+
+    model = quantize_fp_op(
         args.model,
         args.num_labels,
         attention=args.attention or args.quantize_all,
         mlp=args.mlp or args.quantize_all,
+        embedding=args.embedding or args.quantize_all,
+        norm=args.norm or args.quantize_all,
+        head=args.head or args.quantize_all,
+        other=args.other or args.quantize_all,
         quantize_all=args.quantize_all,
         forward_wl=args.wl,
         forward_fl=args.fl,
-        verbose=args.verbose
+        forward_rounding=args.forward_rounding,
+        precision_by_layer_type=precision_by_layer_type,
+        verbose=args.verbose,
     )
-    
+
     if model and not args.verbose:
         print("\nModel quantized successfully. Testing forward pass...")
         dummy_input = torch.randn(1, 3, 224, 224)

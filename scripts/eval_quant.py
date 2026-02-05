@@ -283,6 +283,14 @@ def parse_args():
         default="nearest",
         help="Backward rounding (default: nearest)"
     )
+    parser.add_argument(
+        "--precision-by-layer",
+        type=str,
+        nargs="*",
+        default=None,
+        metavar="KEY:WL,FL",
+        help="Per-layer precision for fixed_op (e.g. attention:8,4 mlp:16,8). Unspecified types use --forward-wl/--forward-fl.",
+    )
     return parser.parse_args()
 
 
@@ -295,8 +303,31 @@ def main():
         from scripts.quantize_fp import quantize_fp
         model = quantize_fp(args.model, args.num_classes, args.attention, args.mlp, args.embedding, args.norm, args.head, args.other, args.quantize_all, args.forward_format, args.forward_wl, args.forward_fl, args.forward_exp, args.forward_man, args.backward_exp, args.backward_man, args.forward_rounding, args.backward_rounding)
     elif args.quant_type == "fixed_op":
-        from scripts.quantize_fixed_op import quantize_fp_op
-        model = quantize_fp_op(args.model, args.num_classes, args.attention, args.mlp, args.embedding, args.norm, args.head, args.other, args.quantize_all, args.forward_format, args.forward_wl, args.forward_fl, args.forward_exp, args.forward_man, args.backward_exp, args.backward_man, args.forward_rounding, args.backward_rounding)
+        from scripts.quantize_fixed_op import quantize_fp_op, parse_precision_by_layer
+        precision_by_layer_type = None
+        if args.precision_by_layer:
+            precision_by_layer_type = parse_precision_by_layer(args.precision_by_layer)
+        model = quantize_fp_op(
+            args.model,
+            args.num_classes,
+            args.attention,
+            args.mlp,
+            args.embedding,
+            args.norm,
+            args.head,
+            args.other,
+            args.quantize_all,
+            args.forward_format,
+            args.forward_wl,
+            args.forward_fl,
+            args.forward_exp,
+            args.forward_man,
+            args.backward_exp,
+            args.backward_man,
+            args.forward_rounding,
+            args.backward_rounding,
+            precision_by_layer_type=precision_by_layer_type,
+        )
     elif args.quant_type == "manual":
         from scripts.quantize_manual import quantize_manual
         model = quantize_manual(args.model, args.num_classes, args.attention, args.mlp, args.embedding, args.norm, args.head, args.other, args.quantize_all)

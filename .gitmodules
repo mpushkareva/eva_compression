@@ -1,0 +1,3 @@
+[submodule "STEP"]
+	path = STEP
+	url = https://github.com/Fancyssc/STEP.git
