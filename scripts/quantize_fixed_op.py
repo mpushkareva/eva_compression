@@ -7,7 +7,6 @@ from typing import Dict, List, Optional, Set, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoImageProcessor, TimmWrapperForImageClassification
 
 
 class FixedPointFormat:
@@ -179,6 +178,49 @@ class FixedPointConv2d(nn.Module):
         return s
 
 
+class FixedPointConv1d(nn.Module):
+    """
+    Conv1d layer with fixed-point weights, biases, and arithmetic.
+    Used by QKFormer and other models that use 1D convolutions in attention/MLP.
+    """
+    def __init__(self, conv: nn.Conv1d, fp_format: FixedPointFormat):
+        super().__init__()
+        self.fp_format = fp_format
+        self.in_channels = conv.in_channels
+        self.out_channels = conv.out_channels
+        self.kernel_size = conv.kernel_size
+        self.stride = conv.stride
+        self.padding = conv.padding
+        self.dilation = conv.dilation
+        self.groups = conv.groups
+        self.padding_mode = conv.padding_mode
+        quantized_weight = fp_format.quantize(conv.weight.data)
+        self.register_buffer('weight', quantized_weight)
+        if conv.bias is not None:
+            quantized_bias = fp_format.quantize(conv.bias.data)
+            self.register_buffer('bias', quantized_bias)
+        else:
+            self.bias = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_fixed = self.fp_format.quantize(x)
+        if self.padding_mode != 'zeros':
+            x_fixed = F.pad(x_fixed, self._reversed_padding_repeated_twice, mode=self.padding_mode)
+        out = F.conv1d(x_fixed, self.weight, self.bias, self.stride,
+                       self.padding, self.dilation, self.groups)
+        return self.fp_format.quantize(out)
+
+    @property
+    def _reversed_padding_repeated_twice(self):
+        padding = self.padding if isinstance(self.padding, tuple) else (self.padding,) * 2
+        return tuple(reversed(padding)) * 2
+
+    def extra_repr(self) -> str:
+        s = (f'{self.in_channels}, {self.out_channels}, kernel_size={self.kernel_size}'
+             f', stride={self.stride}, wl={self.fp_format.wl}, fl={self.fp_format.fl}')
+        return s
+
+
 class FixedPointLayerNorm(nn.Module):
     """
     LayerNorm with fixed-point parameters and arithmetic simulation.
@@ -218,6 +260,86 @@ class FixedPointLayerNorm(nn.Module):
         return self.fp_format.quantize(x_norm)
 
 
+class FixedPointBatchNorm2d(nn.Module):
+    """
+    BatchNorm2d with fixed-point parameters and arithmetic simulation.
+    Quantizes weight (gamma), bias (beta), running statistics, and output.
+    """
+    def __init__(self, bn: nn.BatchNorm2d, fp_format: FixedPointFormat):
+        super().__init__()
+        self.fp_format = fp_format
+        self.num_features = bn.num_features
+        self.eps = bn.eps
+        self.momentum = bn.momentum
+        self.affine = bn.affine
+        self.track_running_stats = bn.track_running_stats
+
+        if self.affine:
+            self.register_buffer('weight', fp_format.quantize(bn.weight.data))
+            self.register_buffer('bias', fp_format.quantize(bn.bias.data))
+
+        if self.track_running_stats:
+            self.register_buffer('running_mean', fp_format.quantize(bn.running_mean.data))
+            self.register_buffer('running_var', fp_format.quantize(bn.running_var.data))
+            self.register_buffer('num_batches_tracked', bn.num_batches_tracked.clone())
+        else:
+            self.running_mean = None
+            self.running_var = None
+            self.num_batches_tracked = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_fixed = self.fp_format.quantize(x)
+        out = F.batch_norm(
+            x_fixed, self.running_mean, self.running_var,
+            self.weight, self.bias, False, 0.0, self.eps
+        )
+        return self.fp_format.quantize(out)
+
+    def extra_repr(self) -> str:
+        return (f'{self.num_features}, eps={self.eps}, affine={self.affine}, '
+                f'wl={self.fp_format.wl}, fl={self.fp_format.fl}')
+
+
+class FixedPointBatchNorm1d(nn.Module):
+    """
+    BatchNorm1d with fixed-point parameters and arithmetic simulation.
+    Quantizes weight (gamma), bias (beta), running statistics, and output.
+    """
+    def __init__(self, bn: nn.BatchNorm1d, fp_format: FixedPointFormat):
+        super().__init__()
+        self.fp_format = fp_format
+        self.num_features = bn.num_features
+        self.eps = bn.eps
+        self.momentum = bn.momentum
+        self.affine = bn.affine
+        self.track_running_stats = bn.track_running_stats
+
+        if self.affine:
+            self.register_buffer('weight', fp_format.quantize(bn.weight.data))
+            self.register_buffer('bias', fp_format.quantize(bn.bias.data))
+
+        if self.track_running_stats:
+            self.register_buffer('running_mean', fp_format.quantize(bn.running_mean.data))
+            self.register_buffer('running_var', fp_format.quantize(bn.running_var.data))
+            self.register_buffer('num_batches_tracked', bn.num_batches_tracked.clone())
+        else:
+            self.running_mean = None
+            self.running_var = None
+            self.num_batches_tracked = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_fixed = self.fp_format.quantize(x)
+        out = F.batch_norm(
+            x_fixed, self.running_mean, self.running_var,
+            self.weight, self.bias, False, 0.0, self.eps
+        )
+        return self.fp_format.quantize(out)
+
+    def extra_repr(self) -> str:
+        return (f'{self.num_features}, eps={self.eps}, affine={self.affine}, '
+                f'wl={self.fp_format.wl}, fl={self.fp_format.fl}')
+
+
 class FixedPointEmbedding(nn.Module):
     """
     Embedding layer with fixed-point weights.
@@ -241,10 +363,11 @@ class FixedPointEmbedding(nn.Module):
 
 
 class LayerTypeIdentifier:
-    """Identifies different layer types in EVA-transformer models."""
+    """Identifies different layer types in EVA-transformer and QKFormer-style models."""
     
-    ATTENTION_PATTERNS = ['attn', 'qkv', 'proj', 'head']
-    MLP_PATTERNS = ['mlp', 'fc1', 'fc2', 'dense']
+    # Include q_conv, k_conv, v_conv for QKFormer/SpikingTransformer attention
+    ATTENTION_PATTERNS = ['attn', 'qkv', 'proj', 'head', 'q_conv', 'k_conv', 'v_conv', 'tssa', 'ssa']
+    MLP_PATTERNS = ['mlp', 'fc1', 'fc2', 'dense', 'fc_conv']
     EMBEDDING_PATTERNS = ['patch_embed', 'pos_embed', 'embed'] # 'rope'
     NORM_PATTERNS = ['norm1', 'norm2', 'ln', 'bn', 'gn']
     HEAD_PATTERNS = ['head', 'classifier', 'fc', 'linear']
@@ -268,6 +391,12 @@ class LayerTypeIdentifier:
         # Check module type
         if isinstance(module, (nn.MultiheadAttention,)):
             return 'attention'
+        elif isinstance(module, nn.Conv1d):
+            if any(p in name_lower for p in cls.ATTENTION_PATTERNS):
+                return 'attention'
+            if any(p in name_lower for p in cls.MLP_PATTERNS):
+                return 'mlp'
+            return 'other'
         elif isinstance(module, (nn.Linear,)):
             if any(p in name_lower for p in cls.HEAD_PATTERNS):
                 return 'head'
@@ -279,8 +408,10 @@ class LayerTypeIdentifier:
         elif isinstance(module, (nn.Embedding, nn.Conv2d)):
             if 'patch' in name_lower or 'embed' in name_lower:
                 return 'embedding'
+            if any(p in name_lower for p in cls.MLP_PATTERNS):
+                return 'mlp'
             return 'other'
-        elif isinstance(module, (nn.LayerNorm, nn.GroupNorm, nn.BatchNorm2d)):
+        elif isinstance(module, (nn.LayerNorm, nn.GroupNorm, nn.BatchNorm2d, nn.BatchNorm1d)):
             return 'norm'
         
         return 'other'
@@ -327,11 +458,16 @@ class FixedPointModelConverter:
             return FixedPointLinear(module, fp_format)
         elif isinstance(module, nn.Conv2d):
             return FixedPointConv2d(module, fp_format)
+        elif isinstance(module, nn.Conv1d):
+            return FixedPointConv1d(module, fp_format)
         elif isinstance(module, nn.LayerNorm):
             return FixedPointLayerNorm(module, fp_format)
         elif isinstance(module, nn.Embedding):
             return FixedPointEmbedding(module, fp_format)
-        # Note: BatchNorm and GroupNorm can be added similarly if needed
+        elif isinstance(module, nn.BatchNorm2d):
+            return FixedPointBatchNorm2d(module, fp_format)
+        elif isinstance(module, nn.BatchNorm1d):
+            return FixedPointBatchNorm1d(module, fp_format)
         return None
     
     def convert_model(self, model: nn.Module) -> nn.Module:
@@ -381,7 +517,8 @@ def load_eva_model(
     num_labels: int = 1000,
     token: Optional[str] = None
 ) -> nn.Module:
-    """Load EVA model from HuggingFace or local path."""
+    """Load EVA model from HuggingFace or local path. Requires transformers."""
+    from transformers import TimmWrapperForImageClassification
     if token is None:
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
     if token is None:
@@ -390,7 +527,7 @@ def load_eva_model(
             token = HfFolder.get_token()
         except Exception:
             token = None
-    
+
     model = TimmWrapperForImageClassification.from_pretrained(
         model_name_or_path,
         num_labels=num_labels,
@@ -448,6 +585,30 @@ def print_layer_analysis(layer_groups: Dict[str, List[str]]):
                 print(f"  - {name}")
             if len(names) > 10:
                 print(f"  ... and {len(names) - 10} more")
+
+
+def apply_fixed_op(
+    model: nn.Module,
+    quantize_config: Dict[str, bool],
+    forward_wl: int = 16,
+    forward_fl: int = 8,
+    forward_rounding: str = "nearest",
+    precision_by_layer_type: Optional[Dict[str, Tuple[int, int]]] = None,
+) -> nn.Module:
+    """
+    Apply fixed-point op-level quantization to an existing nn.Module (e.g. QKFormer).
+    Does not load a model; use this when the model is already built (e.g. in STEP/cls/train.py).
+    """
+    if not any(quantize_config.values()):
+        return model
+    converter = FixedPointModelConverter(
+        quantize_config=quantize_config,
+        wl=forward_wl,
+        fl=forward_fl,
+        rounding=forward_rounding,
+        precision_by_layer_type=precision_by_layer_type,
+    )
+    return converter.convert_model(model)
 
 
 def parse_precision_by_layer(tokens: List[str]) -> Dict[str, Tuple[int, int]]:
